@@ -37,6 +37,7 @@ import { MAX_EMAIL_HTML_LENGTH } from './sanitize-email-html.ts';
 import { hasSentMessageId, normalizeMessageId } from './sent-registry.ts';
 import { truncateUtf8Bytes } from './utf8-truncate.ts';
 import {
+  resolveFreshMailserverHost,
   withMailserverReconnect,
   type MailserverEndpoint,
 } from './mailserver-reconnect.ts';
@@ -149,6 +150,12 @@ export const TOTAL_KEY_MAX = 5_000;
 type ImapClientFactory = (endpoint?: MailserverEndpoint) => ImapFlow;
 type MailserverResolver = (hostname: string) => Promise<string>;
 
+/** Test-only IMAP wait DNS hook. Omit to restore. SMTP does not read this. */
+let waitMailserverResolverForTests: MailserverResolver | undefined;
+export function setWaitMailserverResolverForTests(fn?: MailserverResolver): void {
+  waitMailserverResolverForTests = fn;
+}
+
 function createImapClient(endpoint: MailserverEndpoint = { host: config.imap.host }): ImapFlow {
   return new ImapFlow({
     host: endpoint.host,
@@ -164,6 +171,39 @@ function createImapClient(endpoint: MailserverEndpoint = { host: config.imap.hos
   });
 }
 
+/** Race only the fresh-DNS wait; observe the loser; abort must not create a retry client. */
+async function resolveMailserverAbortable(
+  resolve: MailserverResolver,
+  hostname: string,
+  signal?: AbortSignal,
+): Promise<string> {
+  const resolveP = Promise.resolve(resolve(hostname));
+  void resolveP.catch(() => {});
+  if (!signal) return resolveP;
+  // Low-level abortable DNS uses the existing scan_aborted marker.
+  // waitForMessage maps it via isDisconnectShaped / throwIfDisconnectShaped.
+  if (signal.aborted) throw new Error('scan_aborted');
+  return new Promise<string>((ok, fail) => {
+    const onAbort = () => {
+      signal.removeEventListener('abort', onAbort);
+      fail(new Error('scan_aborted'));
+    };
+    signal.addEventListener('abort', onAbort);
+    resolveP.then(
+      (addr) => {
+        signal.removeEventListener('abort', onAbort);
+        if (signal.aborted) fail(new Error('scan_aborted'));
+        else ok(addr);
+      },
+      (err) => {
+        signal.removeEventListener('abort', onAbort);
+        if (signal.aborted) fail(new Error('scan_aborted'));
+        else fail(err);
+      },
+    );
+  });
+}
+
 async function connectImapClient(
   createClient: ImapClientFactory = createImapClient,
   {
@@ -172,14 +212,21 @@ async function connectImapClient(
     beforeRetryConnect,
     resolveMailserver,
     closeOnConnectError = true,
+    signal,
   }: {
     beforeConnect?: (client: ImapFlow) => void;
     beforeRetry?: (error: unknown) => void | Promise<void>;
     beforeRetryConnect?: () => void;
     resolveMailserver?: MailserverResolver;
     closeOnConnectError?: boolean;
+    signal?: AbortSignal;
   } = {},
 ): Promise<ImapFlow> {
+  const resolve = resolveMailserver ?? waitMailserverResolverForTests;
+  const resolveFn: MailserverResolver | undefined =
+    signal || resolve
+      ? (hostname) => resolveMailserverAbortable(resolve ?? resolveFreshMailserverHost, hostname, signal)
+      : undefined;
   return withMailserverReconnect(
     config.imap.host,
     async (endpoint) => {
@@ -199,7 +246,7 @@ async function connectImapClient(
         throw error;
       }
     },
-    { beforeRetry, beforeRetryConnect, resolve: resolveMailserver },
+    { beforeRetry, beforeRetryConnect, resolve: resolveFn },
   );
 }
 
@@ -361,6 +408,7 @@ export async function withInboxAbortable<T>(
       },
       resolveMailserver,
       closeOnConnectError: false,
+      signal,
     });
     if (connectionError) throw connectionError;
     if (signal.aborted) throw new Error('scan_aborted');
@@ -1233,6 +1281,39 @@ const throwIfDisconnected = (signal?: AbortSignal) => {
   if (signal?.aborted) throw new ClientDisconnectedError();
 };
 
+/** Invoke the optional delegation predicate only; non-delegated waits never call it. */
+function throwIfDelegationRevoked(shouldContinue?: () => boolean): void {
+  if (shouldContinue && !shouldContinue()) {
+    throw new DelegationRevokedError();
+  }
+}
+
+function isDisconnectShaped(err: unknown, signal?: AbortSignal): boolean {
+  return (
+    err instanceof ClientDisconnectedError ||
+    Boolean(signal?.aborted) ||
+    (err instanceof Error && err.message === 'scan_aborted')
+  );
+}
+
+/**
+ * Disconnect-shaped exit: revocation first, then keep/create ClientDisconnectedError.
+ * Does not rewrite InvalidMailCursorError, an already-raised DelegationRevokedError,
+ * or an ordinary IMAP error when the signal is not aborted.
+ */
+function throwIfDisconnectShaped(
+  shouldContinue: (() => boolean) | undefined,
+  signal: AbortSignal | undefined,
+  err?: unknown,
+): void {
+  if (err instanceof InvalidMailCursorError) throw err;
+  if (err instanceof DelegationRevokedError) throw err;
+  if (!isDisconnectShaped(err, signal)) return;
+  throwIfDelegationRevoked(shouldContinue);
+  if (err instanceof ClientDisconnectedError) throw err;
+  throw new ClientDisconnectedError();
+}
+
 /** 可取消睡眠；abort 须先于 IDLE 失败后的兜底 sleep 抛出。 */
 function abortableSleep(ms: number, signal?: AbortSignal): Promise<void> {
   return startHeartbeat(ms, signal).promise;
@@ -1295,7 +1376,9 @@ async function logoutBounded(
   const remaining = Math.max(0, deadline - Date.now());
   const bound = new AbortController();
   const onDisc = () => bound.abort();
-  signal?.addEventListener('abort', onDisc, { once: true });
+  // Observe current aborted state; addEventListener does not replay a past abort.
+  if (signal?.aborted) bound.abort();
+  else signal?.addEventListener('abort', onDisc, { once: true });
   const timer = setTimeout(() => bound.abort(), remaining);
   try {
     await Promise.race([
@@ -1314,7 +1397,7 @@ async function logoutBounded(
     } catch {
       /* already dead */
     }
-    await logoutP.catch(() => {});
+    // Bound won: close now and return; do not await a possibly permanent logoutP.
   } finally {
     clearTimeout(timer);
     signal?.removeEventListener('abort', onDisc);
@@ -1347,13 +1430,16 @@ export async function waitForMessage(
   shouldContinue?: () => boolean,
   signal?: AbortSignal,
 ): Promise<MessageDetail | null> {
+  throwIfDelegationRevoked(shouldContinue);
   throwIfDisconnected(signal);
   const deadline = Date.now() + timeoutSec * 1000;
   try {
     return await waitWithIdle(address, filters, deadline, shouldContinue, signal);
   } catch (err) {
-    if (err instanceof DelegationRevokedError || err instanceof InvalidMailCursorError || err instanceof ClientDisconnectedError) throw err;
-    if (signal?.aborted) throw new ClientDisconnectedError(); // connect 被 abort 时常抛 closed
+    if (err instanceof DelegationRevokedError || err instanceof InvalidMailCursorError) throw err;
+    if (err instanceof ClientDisconnectedError || signal?.aborted) {
+      throwIfDisconnectShaped(shouldContinue, signal, err);
+    }
     // 代际失败不是断线，禁止吞成轮询/超时（2269 wait → 400 invalid_cursor）。
     console.warn('[imap] IDLE wait failed, falling back to polling:', (err as Error).message);
     return waitWithPolling(address, filters, deadline, shouldContinue, signal);
@@ -1375,14 +1461,17 @@ async function waitWithIdle(
   let provisional: MessageDetail | null | undefined;
   try {
     client = await connectImapClient(undefined, {
-      beforeConnect: (created) => { client = created; throwIfDisconnected(signal); },
+      beforeConnect: (created) => {
+        client = created;
+        throwIfDelegationRevoked(shouldContinue);
+        throwIfDisconnected(signal);
+      },
+      signal,
     });
     lock = await client.getMailboxLock('INBOX');
     while (Date.now() < deadline) {
+      throwIfDelegationRevoked(shouldContinue);
       throwIfDisconnected(signal);
-      if (shouldContinue && !shouldContinue()) {
-        throw new DelegationRevokedError();
-      }
       const found = await findMatchWith(client, address, filters);
       if (found) {
         if (shouldContinue && !shouldContinue()) {
@@ -1398,8 +1487,15 @@ async function waitWithIdle(
       try {
         await Promise.race([idleP, hb.promise]);
       } catch (err) {
-        if (err instanceof ClientDisconnectedError) throw err;
-        await abortableSleep(Math.min(3000, deadline - Date.now()), signal);
+        if (isDisconnectShaped(err, signal)) {
+          throwIfDisconnectShaped(shouldContinue, signal, err);
+        }
+        try {
+          await abortableSleep(Math.min(3000, deadline - Date.now()), signal);
+        } catch (sleepErr) {
+          throwIfDisconnectShaped(shouldContinue, signal, sleepErr);
+          throw sleepErr;
+        }
       } finally {
         hb.dispose();
       }
@@ -1412,6 +1508,7 @@ async function waitWithIdle(
     }
   } catch (err) {
     failed = true;
+    throwIfDisconnectShaped(shouldContinue, signal, err);
     throw err;
   } finally {
     try {
@@ -1446,10 +1543,8 @@ async function waitWithPolling(
   signal?: AbortSignal,
 ): Promise<MessageDetail | null> {
   while (Date.now() < deadline) {
+    throwIfDelegationRevoked(shouldContinue);
     throwIfDisconnected(signal);
-    if (shouldContinue && !shouldContinue()) {
-      throw new DelegationRevokedError();
-    }
     try {
       const found = signal
         ? await withInboxAbortable(signal, (client) => findMatchWith(client, address, filters))
@@ -1463,16 +1558,22 @@ async function waitWithPolling(
       }
       throwIfDisconnected(signal);
     } catch (err) {
-      if (err instanceof DelegationRevokedError || err instanceof InvalidMailCursorError || err instanceof ClientDisconnectedError) throw err;
-      if (signal?.aborted || (err instanceof Error && err.message === 'scan_aborted')) throw new ClientDisconnectedError();
+      if (err instanceof DelegationRevokedError || err instanceof InvalidMailCursorError) throw err;
+      if (isDisconnectShaped(err, signal)) {
+        throwIfDisconnectShaped(shouldContinue, signal, err);
+      }
       console.warn('[imap] poll failed:', (err as Error).message);
     }
     const remaining = deadline - Date.now();
     if (remaining <= 0) break;
-    await abortableSleep(Math.min(3000, remaining), signal);
+    try {
+      await abortableSleep(Math.min(3000, remaining), signal);
+    } catch (sleepErr) {
+      throwIfDisconnectShaped(shouldContinue, signal, sleepErr);
+      throw sleepErr;
+    }
   }
-  if (shouldContinue && !shouldContinue()) {
-    throw new DelegationRevokedError();
-  }
+  throwIfDelegationRevoked(shouldContinue);
+  throwIfDisconnected(signal);
   return null;
 }

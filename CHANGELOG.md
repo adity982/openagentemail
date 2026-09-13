@@ -2,6 +2,21 @@
 
 All notable changes to this project are documented here, one section per release, newest first.
 
+## v0.7.3 — 2026-09-13
+
+### Added
+
+- **Signed webhook wake receiver example** (`examples/webhook-wake/`): a ready-to-run "doorbell" endpoint that verifies openagent.email webhook signatures and wakes your agent runtime when mail arrives — the reference piece for wiring webhooks into agent fleets (#172, #176).
+
+### Fixed
+
+- **Long waits re-arm correctly instead of hot-looping** (#203, #206): after an early 408, `mail_wait_for` could re-issue waits in a tight loop. Waits now re-arm cleanly under the caller's timeout budget.
+- **Cancellation and revocation now win deterministically** (#204, #206): revoking a delegated wait mid-wait returns 403 (revoked), never a misleading 499/408; client disconnects free the wait slot immediately — including while DNS resolution is still in flight — and post-disconnect logout can no longer hang until the deadline.
+- **Tasks: pending lease fences survive restarts** (#181): task claims in flight are no longer lost when the server restarts.
+- **Tasks: signed expiry receipts for accepted deadline windows** (#156, #185).
+- **API: per-caller rate limit on GET /v1/messages** (#192).
+- **API: backward mail cursors are bound to the mailbox generation** (#195): cursors can no longer silently page into a rebuilt mailbox.
+
 ## v0.7.2 — 2026-09-09
 
 ### Added

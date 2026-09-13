@@ -12,7 +12,7 @@ All notable changes to this project are documented here, one section per release
 
 - **Long waits re-arm correctly instead of hot-looping** (#203, #206): after an early 408, `mail_wait_for` could re-issue waits in a tight loop. Waits now re-arm cleanly under the caller's timeout budget.
 - **Cancellation and revocation now win deterministically** (#204, #206): revoking a delegated wait mid-wait returns 403 (revoked), never a misleading 499/408; client disconnects free the wait slot immediately — including while DNS resolution is still in flight — and post-disconnect logout can no longer hang until the deadline.
-- **Tasks: pending lease fences survive restarts** (#181): task claims in flight are no longer lost when the server restarts.
+- **Tasks: pending-lease journal + claim_lost + postponed expiry audit** (opt-in): `TASK_LEASES_PENDING_JOURNAL` (default false, requires `TASK_LEASES_ENABLED`) persists conservative pre-SMTP generation fences, admin-signed `claim_lost` after 2h, and records or defers expiry-audit work. Production expiry-audit SMTP emission remains hard-disabled pending a separate commander-approved card; the journal flag is not an emitter opt-in. Upgrade readers before the first tombstone; old-binary rollback after the first `claim_lost` is unsafe (#80, #84; #181).
 - **Tasks: signed expiry receipts for accepted deadline windows** (#156, #185).
 - **API: per-caller rate limit on GET /v1/messages** (#192).
 - **API: backward mail cursors are bound to the mailbox generation** (#195): cursors can no longer silently page into a rebuilt mailbox.
@@ -25,7 +25,6 @@ All notable changes to this project are documented here, one section per release
 
 ### Fixed
 
-- **Tasks: pending-lease journal + claim_lost + postponed expiry audit** (opt-in): `TASK_LEASES_PENDING_JOURNAL` (default false, requires `TASK_LEASES_ENABLED`) persists conservative pre-SMTP generation fences, admin-signed `claim_lost` after 2h, and records or defers expiry-audit work. Production expiry-audit SMTP emission remains hard-disabled pending a separate commander-approved card; the journal flag is not an emitter opt-in. Upgrade readers before the first tombstone; old-binary rollback after the first `claim_lost` is unsafe (#80, #84).
 - **Tasks: bound public-read lease overlay replay** (opt-in): public read projections cap lease overlay replay at 15 minutes, preventing unbounded replay on read paths. Disabled by default — enable with `TASK_LEASES_OVERLAY_BOUND=true` (#80, #84; #171).
 - **Tasks: decouple reclaim from expiry-audit SMTP** (opt-in): lease reclaim no longer depends on the expiry-audit mail path, with late-receipt tolerance. Disabled by default — enable with `TASK_LEASES_EXPIRY_AUDIT_M3=true` (#80, #84; #167).
 

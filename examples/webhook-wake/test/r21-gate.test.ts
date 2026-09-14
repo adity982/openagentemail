@@ -16,6 +16,7 @@ import {
   type FileConfig,
 } from '../src/config.ts';
 import { DedupError, DedupStore, buildNofollowOpenFlags, inspectDedupFile } from '../src/dedup.ts';
+import { isLoopbackHost } from '../src/ids.ts';
 import { canReplaceDedupTarget, inspectStateWritable } from '../src/readiness.ts';
 import {
   FIXTURE_SECRET,
@@ -306,5 +307,44 @@ describe('R1 listenReceiver library non-loopback guard', () => {
     receivers.push(open);
     const openUrl = await listenReceiver(open);
     expect(openUrl).toMatch(/^http:\/\/0\.0\.0\.0:\d+/);
+  });
+});
+
+describe('R2 IPv4 loopback 127.0.0.0/8', () => {
+  test('正控：127.0.0.2 无 opt-in 可载并可听；::1/localhost/127.0.0.1 仍认', async () => {
+    expect(isLoopbackHost('127.0.0.1')).toBe(true);
+    expect(isLoopbackHost('127.0.0.2')).toBe(true);
+    expect(isLoopbackHost('127.255.255.255')).toBe(true);
+    expect(isLoopbackHost('::1')).toBe(true);
+    expect(isLoopbackHost('localhost')).toBe(true);
+
+    const dir = tempDir();
+    const cfg = parseFileConfig({
+      ...fileBase(dir),
+      listen: { host: '127.0.0.2', port: 0 },
+    });
+    expect(cfg.listen.host).toBe('127.0.0.2');
+    expect(cfg.listen.allowNonLoopback).toBe(false);
+
+    const receiver = await startReceiver(
+      testConfig({ listen: { host: '127.0.0.2', port: 0, allowNonLoopback: false } }, dir),
+    );
+    receivers.push(receiver);
+    expect(receiver.url()).toMatch(/^http:\/\/127\.0\.0\.2:\d+/);
+  });
+
+  test('负控：127.256.0.1 畸形非 loopback；8.8.8.8 无 opt-in 仍拒（不回归）', () => {
+    expect(isLoopbackHost('127.256.0.1')).toBe(false);
+    expect(isLoopbackHost('127.0.0.256')).toBe(false);
+    expect(isLoopbackHost('8.8.8.8')).toBe(false);
+
+    const dir = tempDir();
+    const base = fileBase(dir);
+    expect(() => parseFileConfig({ ...base, listen: { host: '127.256.0.1', port: 0 } })).toThrow(
+      'config_invalid:listen.allowNonLoopback',
+    );
+    expect(() => parseFileConfig({ ...base, listen: { host: '8.8.8.8', port: 0 } })).toThrow(
+      'config_invalid:listen.allowNonLoopback',
+    );
   });
 });

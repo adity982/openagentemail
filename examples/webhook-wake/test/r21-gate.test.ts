@@ -12,6 +12,7 @@ import {
   MAX_ALERT_HOOK_TIMEOUT_MS,
   MAX_REQUEST_TIMEOUT_MS,
   MAX_SEND_TIMEOUT_MS,
+  REQUEST_SEND_HEADROOM_MS,
   parseFileConfig,
   type FileConfig,
 } from '../src/config.ts';
@@ -132,9 +133,14 @@ describe('R21 timer load-time caps', () => {
     expect(parseFileConfig({ ...base, requestTimeoutMs: MAX_REQUEST_TIMEOUT_MS }).requestTimeoutMs).toBe(
       MAX_REQUEST_TIMEOUT_MS,
     );
-    expect(parseFileConfig({ ...base, sendTimeoutMs: MAX_SEND_TIMEOUT_MS }).sendTimeoutMs).toBe(
-      MAX_SEND_TIMEOUT_MS,
-    );
+    // send 顶满 30s 时 request 默认 10s 不满足 headroom；合法上沿 = request−2s
+    expect(
+      parseFileConfig({
+        ...base,
+        requestTimeoutMs: MAX_REQUEST_TIMEOUT_MS,
+        sendTimeoutMs: MAX_REQUEST_TIMEOUT_MS - REQUEST_SEND_HEADROOM_MS,
+      }).sendTimeoutMs,
+    ).toBe(MAX_REQUEST_TIMEOUT_MS - REQUEST_SEND_HEADROOM_MS);
     expect(
       parseFileConfig({ ...base, alertHook: { timeoutMs: MAX_ALERT_HOOK_TIMEOUT_MS } }).alertHook.timeoutMs,
     ).toBe(MAX_ALERT_HOOK_TIMEOUT_MS);
@@ -346,5 +352,38 @@ describe('R2 IPv4 loopback 127.0.0.0/8', () => {
     expect(() => parseFileConfig({ ...base, listen: { host: '8.8.8.8', port: 0 } })).toThrow(
       'config_invalid:listen.allowNonLoopback',
     );
+  });
+});
+
+describe('R3 request/send headroom', () => {
+  test('负控：requestTimeoutMs == sendTimeoutMs 拒载；正控：request == send + 2000 通过；默认 10s/8s 不回归', () => {
+    const dir = tempDir();
+    const base = fileBase(dir);
+    // 默认 10000/8000 满足 10000 >= 8000+2000
+    const defaults = parseFileConfig(base);
+    expect(defaults.requestTimeoutMs).toBe(10_000);
+    expect(defaults.sendTimeoutMs).toBe(8_000);
+
+    expect(() =>
+      parseFileConfig({ ...base, requestTimeoutMs: 8_000, sendTimeoutMs: 8_000 }),
+    ).toThrow('config_invalid:requestTimeoutMs.headroom');
+    expect(() =>
+      parseFileConfig({ ...base, requestTimeoutMs: 30_000, sendTimeoutMs: 30_000 }),
+    ).toThrow('config_invalid:requestTimeoutMs.headroom');
+
+    const ok = parseFileConfig({
+      ...base,
+      requestTimeoutMs: 10_000,
+      sendTimeoutMs: 8_000, // == request − 2000
+    });
+    expect(ok.requestTimeoutMs).toBe(10_000);
+    expect(ok.sendTimeoutMs).toBe(8_000);
+
+    const okMax = parseFileConfig({
+      ...base,
+      requestTimeoutMs: MAX_REQUEST_TIMEOUT_MS,
+      sendTimeoutMs: MAX_REQUEST_TIMEOUT_MS - REQUEST_SEND_HEADROOM_MS,
+    });
+    expect(okMax.sendTimeoutMs).toBe(28_000);
   });
 });

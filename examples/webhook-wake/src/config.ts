@@ -28,6 +28,12 @@ export const DEFAULT_MAX_RECORDS = 10_000;
 export const MAX_REQUEST_TIMEOUT_MS = 30_000;
 export const MAX_SEND_TIMEOUT_MS = 30_000;
 export const MAX_ALERT_HOOK_TIMEOUT_MS = 10_000;
+/**
+ * request 外层计时在 body 处理与 wake/send 计时之前启动。
+ * 须 requestTimeoutMs >= sendTimeoutMs + 2s，否则 request 必先到点，send 预算永远走不满。
+ * 不加高 cap：合法配置下 send 有效上沿 = MAX_REQUEST − HEADROOM。
+ */
+export const REQUEST_SEND_HEADROOM_MS = 2_000;
 /** Host/Content-Type/Content-Length and other non-signature request headers. */
 export const HTTP_HEADER_OVERHEAD_BYTES = 4096;
 
@@ -378,6 +384,23 @@ export function parseFileConfig(raw: unknown, options?: { loadSecrets?: boolean 
     throw new Error('config_invalid:listen.allowNonLoopback');
   }
 
+  const requestTimeoutMs = optionalPositiveIntWithMax(
+    parsed.requestTimeoutMs,
+    'requestTimeoutMs',
+    10_000,
+    MAX_REQUEST_TIMEOUT_MS,
+  );
+  const sendTimeoutMs = optionalPositiveIntWithMax(
+    parsed.sendTimeoutMs,
+    'sendTimeoutMs',
+    8_000,
+    MAX_SEND_TIMEOUT_MS,
+  );
+  // 跨字段：外层 request 须覆盖 send 预算 + 2s 余量（body/编排开销）
+  if (requestTimeoutMs < sendTimeoutMs + REQUEST_SEND_HEADROOM_MS) {
+    throw new Error('config_invalid:requestTimeoutMs.headroom');
+  }
+
   return {
     listen: {
       host: listenHost,
@@ -395,9 +418,9 @@ export function parseFileConfig(raw: unknown, options?: { loadSecrets?: boolean 
       assertHttpHeaderTransport(value);
       return value;
     })(),
-    requestTimeoutMs: optionalPositiveIntWithMax(parsed.requestTimeoutMs, 'requestTimeoutMs', 10_000, MAX_REQUEST_TIMEOUT_MS),
+    requestTimeoutMs,
     maxConcurrent: optionalPositiveInt(parsed.maxConcurrent, 'maxConcurrent', 16),
-    sendTimeoutMs: optionalPositiveIntWithMax(parsed.sendTimeoutMs, 'sendTimeoutMs', 8_000, MAX_SEND_TIMEOUT_MS),
+    sendTimeoutMs,
     outputCapBytes: optionalPositiveInt(parsed.outputCapBytes, 'outputCapBytes', 4096),
     wakeHistoryLimit: optionalNonNegInt(parsed.wakeHistoryLimit, 'wakeHistoryLimit', 0),
     dedup: {

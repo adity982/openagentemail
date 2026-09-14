@@ -213,7 +213,9 @@ Present values must already be integers of the documented sign.
 Extra load rules today: `listen.port` (0–65535), `dedup.retentionMs`
 (≥72h + 1h delivery margin), `dedup.path` (absolute),
 `requestTimeoutMs` / `sendTimeoutMs` / `alertHook.timeoutMs` (positive
-integers capped at the recommended upper band), `alertHook.url`
+integers capped at the recommended upper band; also
+`requestTimeoutMs >= sendTimeoutMs + 2000` or
+`config_invalid:requestTimeoutMs.headroom`), `alertHook.url`
 (`http:`/`https:` or `null`), and `listen.allowNonLoopback` (required
 `true` when `listen.host` is not loopback).
 
@@ -224,9 +226,9 @@ integers capped at the recommended upper band), `alertHook.url`
 | `timestampToleranceSec` | 300 | integer > 0 | 60–600 | Replay window. Large values accept stale signatures. |
 | `maxV1Signatures` | 8 | integer > 0 | 2–16 | Rotation candidates. Too low rejects a valid current+previous header. |
 | `maxHeaderBytes` | 2048 | integer > 0 | 2048–8192 | **UTF-8 byte** length (`Buffer.byteLength`). The parser and `createServer({ maxHeaderSize })` use `maxHeaderBytes + 4096` so other request headers fit. If that total exceeds the process `http.maxHeaderSize` (Bun default 16384), **load fails** (`config_invalid:maxHeaderBytes_exceeds_transport`). Raise the runtime (`bun --max-http-header-size=…`) before promising a larger signature. Too small → 401 `invalid_header`. |
-| `requestTimeoutMs` | 10000 | integer 1–30000 | 2000–30000 | Aborts an unfinished **HTTP body read** and frees the concurrent slot. Does not kill an already-spawned Orca child. |
+| `requestTimeoutMs` | 10000 | integer 1–30000 | 2000–30000 | Aborts an unfinished **HTTP body read** and frees the concurrent slot. Does not kill an already-spawned Orca child. Must be ≥ `sendTimeoutMs` + 2000. |
 | `maxConcurrent` | 16 | integer > 0 | 1–64 | In-flight HTTP cap. `0` fails load. Too low → 503 `busy`. |
-| `sendTimeoutMs` | 8000 | integer 1–30000 | 1000–30000 | SIGKILL of the **spawned job process group** after this budget. Independent of `requestTimeoutMs`. Too small → 503 `timeout_killed`. |
+| `sendTimeoutMs` | 8000 | integer 1–30000 | 1000–30000 | SIGKILL of the **spawned job process group** after this budget. Must leave ≥2s headroom under `requestTimeoutMs` (see Timer distinction). Too small → 503 `timeout_killed`. |
 | `outputCapBytes` | 4096 | integer > 0 | 1024–16384 | Bound on **retained** child stdout/stderr counts. Excess is drained and discarded (not pipe-destroyed) so a zero-exit send still commits. |
 | `wakeHistoryLimit` | 0 | integer ≥ 0 | 0–128 | In-memory ring only. `0` disables history. |
 | `dedup.path` | `/var/lib/webhook-wake/dedup.json` | absolute file path | absolute file path | Relative paths, trailing separators (`/tmp/x.json/`), and root-as-file (`/`) fail load (`config_invalid:dedup.path`) before any store I/O. Present `dedup` must be an object (`config_invalid:dedup`). |
@@ -251,10 +253,15 @@ all-digit state prints
 cooldown 60–900s, curl 2–10s, alert timeout 1–5s. A future persisted
 `last_alert` is treated as **not** in cooldown.
 
-**Timer distinction:** `requestTimeoutMs` is the inbound HTTP deadline.
-`sendTimeoutMs` is the child-kill deadline after a wake starts. Setting
-either far below the other does not compensate: a late body can still
-complete a wake if the request already passed to send, and a tiny send
+**Timer distinction:** `requestTimeoutMs` is the inbound HTTP deadline
+(starts before body handling and wake/send). `sendTimeoutMs` is the
+child-kill deadline after a wake starts. Because the request timer is
+already running when send begins, load requires
+`requestTimeoutMs >= sendTimeoutMs + 2000` (2s headroom for body/orchestration;
+`config_invalid:requestTimeoutMs.headroom` otherwise) so a full send budget
+can still elapse. Caps stay ≤30000 — do not raise them to invent headroom.
+Setting either far below the other still does not compensate: a late body
+can complete a wake if the request already passed to send, and a tiny send
 budget kills a healthy child while the HTTP slot is still open.
 
 **Runtime timer range + load-time caps:**

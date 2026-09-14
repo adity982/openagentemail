@@ -4,8 +4,11 @@ import { accessSync, constants, lstatSync, statSync } from 'node:fs';
 import { dirname, isAbsolute } from 'node:path';
 import { canaryTerminalBound } from './config.ts';
 import { inspectDedupFile } from './dedup.ts';
+import { canReplaceDedupTarget } from './fs-replace.ts';
 import { isLoopbackHost } from './ids.ts';
 import type { ReceiverConfig } from './types.ts';
+
+export { canReplaceDedupTarget } from './fs-replace.ts';
 
 export type MappingReport = {
   routeKey: string;
@@ -37,30 +40,6 @@ export function isRegularExecutable(path: string): boolean {
   } catch {
     return false;
   }
-}
-
-/**
- * Sticky parents allow directory writes but can deny replacing another UID's file.
- * Missing targets stay allowed. Not a complete TOCTOU defense.
- */
-function canReplaceDedupTarget(dedupPath: string): boolean {
-  let target;
-  try {
-    target = lstatSync(dedupPath);
-  } catch (err) {
-    return (err as NodeJS.ErrnoException).code === 'ENOENT';
-  }
-  let parent;
-  try {
-    parent = statSync(dirname(dedupPath));
-  } catch {
-    return false;
-  }
-  if ((parent.mode & 0o1000) === 0) return true;
-  if (typeof process.getuid !== 'function') return true;
-  const uid = process.getuid();
-  if (uid === 0) return true;
-  return target.uid === uid || parent.uid === uid;
 }
 
 function isDirWith(dir: string, mode: number): boolean {
@@ -115,7 +94,11 @@ export function inspectStateWritable(dedupPath: string): boolean {
   if (!creationDir || !isDirWith(creationDir, constants.R_OK | constants.W_OK | constants.X_OK)) {
     return false;
   }
+  // 主文件与 pending `.dirsync` 都必须可替换，否则 wake 成功后 commit 才会 503
   if (!canReplaceDedupTarget(dedupPath)) {
+    return false;
+  }
+  if (!canReplaceDedupTarget(`${dedupPath}.dirsync`)) {
     return false;
   }
   cursor = dirname(creationDir);

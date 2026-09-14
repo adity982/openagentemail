@@ -31,8 +31,11 @@ logEvent('info', 'startup', {
   ready: ready.ready,
   warnings: ready.warnings,
 });
-if (!isLoopbackHost(config.listen.host)) {
-  logEvent('warn', 'listen_not_loopback', { host: config.listen.host });
+// 非 loopback 必须显式 opt-in（parseFileConfig 已拒载；此处双保险）
+if (!isLoopbackHost(config.listen.host) && !config.listen.allowNonLoopback) {
+  logEvent('error', 'listen_not_loopback', { host: config.listen.host });
+  console.error('config_invalid:listen.allowNonLoopback');
+  process.exit(2);
 }
 if (!ready.ready) {
   logEvent('error', 'startup_not_ready', { warnings: ready.warnings });

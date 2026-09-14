@@ -44,10 +44,20 @@ describe('R15 listen container and alertHook.url', () => {
   test('present listen must be an object; invalid host does not default', () => {
     const dir = tempDir();
     const base = fileBase(dir);
-    expect(parseFileConfig(base).listen).toEqual({ host: '127.0.0.1', port: 8787 });
-    expect(parseFileConfig({ ...base, listen: { host: '0.0.0.0', port: 0 } }).listen).toEqual({
+    expect(parseFileConfig(base).listen).toEqual({
+      host: '127.0.0.1',
+      port: 8787,
+      allowNonLoopback: false,
+    });
+    expect(() => parseFileConfig({ ...base, listen: { host: '0.0.0.0', port: 0 } })).toThrow(
+      'config_invalid:listen.allowNonLoopback',
+    );
+    expect(
+      parseFileConfig({ ...base, listen: { host: '0.0.0.0', port: 0, allowNonLoopback: true } }).listen,
+    ).toEqual({
       host: '0.0.0.0',
       port: 0,
+      allowNonLoopback: true,
     });
     expect(() => parseFileConfig({ ...base, listen: '0.0.0.0' } as unknown as FileConfig)).toThrow(
       'config_invalid:listen',

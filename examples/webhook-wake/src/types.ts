@@ -26,7 +26,7 @@ export type AlertHookConfig = {
 };
 
 export type ReceiverConfig = {
-  listen: { host: string; port: number };
+  listen: { host: string; port: number; allowNonLoopback?: boolean };
   mode: ReceiverMode;
   canaryTerminal: string | null;
   orcaBinary: string;

@@ -50,8 +50,19 @@ export function isDomain(value: string): boolean {
   );
 }
 
+/**
+ * 是否 loopback 监听地址。IPv4 认整个 127.0.0.0/8（非仅 127.0.0.1）；
+ * 畸形段（如 127.256.x.x）返回 false。::1 / localhost 不变。
+ */
 export function isLoopbackHost(host: string): boolean {
-  return host === '127.0.0.1' || host === '::1' || host === 'localhost';
+  if (host === '::1' || host === 'localhost') return true;
+  // 127.0.0.0/8：先匹配形态，再逐段校验 0–255，拒 127.256.0.1 等
+  const m = /^127\.(\d{1,3})\.(\d{1,3})\.(\d{1,3})$/.exec(host);
+  if (!m) return false;
+  return m.slice(1).every((oct) => {
+    const n = Number(oct);
+    return Number.isInteger(n) && n >= 0 && n <= 255;
+  });
 }
 
 function isMailboxLocal(local: string): boolean {

@@ -31,7 +31,7 @@ export function testRoute(overrides: Partial<RouteBinding> = {}): RouteBinding {
 export function testConfig(overrides: Partial<ReceiverConfig> = {}, dir?: string): ReceiverConfig {
   const root = dir ?? tempDir();
   return {
-    listen: { host: '127.0.0.1', port: 0 },
+    listen: { host: '127.0.0.1', port: 0, allowNonLoopback: false },
     mode: 'observe',
     canaryTerminal: CANARY_TERMINAL,
     orcaBinary: '/usr/local/bin/orca',
@@ -52,7 +52,7 @@ export function testConfig(overrides: Partial<ReceiverConfig> = {}, dir?: string
     alertHook: { url: null, timeoutMs: 200 },
     routes: [testRoute()],
     ...overrides,
-    listen: { host: '127.0.0.1', port: 0, ...overrides.listen },
+    listen: { host: '127.0.0.1', port: 0, allowNonLoopback: false, ...overrides.listen },
     dedup: {
       path: join(root, 'dedup.json'),
       retentionMs: 7 * 24 * 60 * 60 * 1000,

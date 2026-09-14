@@ -24,6 +24,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { canReplaceDedupTarget } from './fs-replace.ts';
 import type { DedupConfig, DedupRecord } from './types.ts';
 
 export class DedupError extends Error {
@@ -89,12 +90,9 @@ export type DedupInspect =
 export function inspectRegularStateFile(path: string): 'missing' | 'file' | 'not_file' | 'unreadable' {
   try {
     const link = lstatSync(path);
+    // 永不跟随：symlink 视为非普通文件（与 FIFO 同属 fail-closed）
     if (link.isSymbolicLink()) {
-      try {
-        return statSync(path).isFile() ? 'file' : 'not_file';
-      } catch (err) {
-        return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'not_file' : 'unreadable';
-      }
+      return 'not_file';
     }
     return link.isFile() ? 'file' : 'not_file';
   } catch (err) {
@@ -155,6 +153,10 @@ export function inspectDedupFile(
     return { ok: false, reason: 'state_dirsync_unreadable' };
   }
   if (dirsyncKind === 'file') {
+    // sticky 外属 .dirsync 无法 unlink：wake 前 fail-closed，避免序颠倒
+    if (!canReplaceDedupTarget(dirsync)) {
+      return { ok: false, reason: 'state_dirsync_unreadable' };
+    }
     try {
       accessSync(dirsync, constants.R_OK);
     } catch {
@@ -275,12 +277,25 @@ function fsyncDirectory(dir: string): void {
 export const DEDUP_TEMP_NAME_PREFIX = 'ww';
 export const FS_NAME_MAX_BYTES = 255;
 
+/**
+ * Fail-closed：平台无 O_NOFOLLOW 时禁止静默退化成可跟随写。
+ * 第二参可注入以便单测 stub；省略第二参时用 constants.O_NOFOLLOW。
+ * 注意：显式传入 undefined 不算「省略」（arguments.length>=2），须抛错，
+ * 避免 default 参数把缺失 stub 静默回落到生产常量。
+ */
+export function buildNofollowOpenFlags(baseFlags: number, nofollow?: unknown): number {
+  // 省略第二参 → 生产常量；显式 undefined/非 number → fail-closed
+  const flag = arguments.length >= 2 ? nofollow : constants.O_NOFOLLOW;
+  if (typeof flag !== 'number') {
+    throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_symlink');
+  }
+  return baseFlags | flag;
+}
+
 /** Exclusive create in `parent`. Not a complete shared-directory / TOCTOU defense. */
 function createExclusiveTemp(parent: string, prefix: string): { fd: number; path: string } {
-  let flags = constants.O_RDWR | constants.O_CREAT | constants.O_EXCL;
-  if (typeof constants.O_NOFOLLOW === 'number') {
-    flags |= constants.O_NOFOLLOW;
-  }
+  // openSync 之前强制 O_NOFOLLOW；缺失即抛，不静默退化
+  const flags = buildNofollowOpenFlags(constants.O_RDWR | constants.O_CREAT | constants.O_EXCL);
   let last: NodeJS.ErrnoException | undefined;
   for (let attempt = 0; attempt < 8; attempt++) {
     const name = `${prefix}.${randomBytes(16).toString('hex')}`;
@@ -483,17 +498,46 @@ export class DedupStore {
 
   /** Reject FIFO/dir/socket before a blocking writeFileSync on the marker. */
   private assertUnackedWritable(): void {
-    const kind = inspectRegularStateFile(this.unackedPath());
-    if (kind === 'missing' || kind === 'file') return;
-    if (kind === 'unreadable') {
+    // lstat：symlink 放行到 O_NOFOLLOW open（由 open 咬红）；FIFO/dir 仍拒
+    try {
+      const st = lstatSync(this.unackedPath());
+      if (st.isSymbolicLink()) return;
+      if (st.isFile()) {
+        try {
+          accessSync(this.unackedPath(), constants.R_OK | constants.W_OK);
+        } catch {
+          throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_unreadable');
+        }
+        return;
+      }
+      throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_not_file');
+    } catch (err) {
+      if (err instanceof DedupError) throw err;
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_unreadable');
     }
-    throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_not_file');
   }
 
   private markUnacked(): void {
+    // 回收路径与 persistUnacked 同款：同 fd O_NOFOLLOW；无该旗则 fail-closed
     this.assertUnackedWritable();
-    writeFileSync(this.unackedPath(), 'unacked\n', { mode: 0o600 });
+    const marker = this.unackedPath();
+    const flags = buildNofollowOpenFlags(constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC);
+    let fd: number;
+    try {
+      fd = openSync(marker, flags, 0o600);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP' || code === 'EPERM') {
+        throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_symlink');
+      }
+      throw err;
+    }
+    try {
+      writeSync(fd, 'unacked\n');
+    } finally {
+      closeSync(fd);
+    }
   }
 
   /** File + parent-dir fsync so a crash after rename still sees the marker. */
@@ -504,9 +548,20 @@ export class DedupStore {
     }
     this.assertUnackedWritable();
     const marker = this.unackedPath();
-    writeFileSync(marker, 'unacked\n', { mode: 0o600 });
-    const fd = openSync(marker, 'r+');
+    // 同描述符非跟随写；O_NOFOLLOW 缺失时 buildNofollowOpenFlags 已 fail-closed
+    const flags = buildNofollowOpenFlags(constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC);
+    let fd: number;
     try {
+      fd = openSync(marker, flags, 0o600);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP' || code === 'EPERM') {
+        throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_symlink');
+      }
+      throw err;
+    }
+    try {
+      writeSync(fd, 'unacked\n');
       fsyncSync(fd);
     } finally {
       closeSync(fd);

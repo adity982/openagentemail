@@ -4,7 +4,7 @@
  */
 
 import { afterEach, describe, expect, test } from 'bun:test';
-import { existsSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
+import { constants, existsSync, mkdirSync, readFileSync, symlinkSync, unlinkSync, writeFileSync } from 'node:fs';
 import { spawnSync } from 'node:child_process';
 import { join } from 'node:path';
 import { fileURLToPath } from 'node:url';
@@ -15,7 +15,7 @@ import {
   parseFileConfig,
   type FileConfig,
 } from '../src/config.ts';
-import { DedupError, DedupStore, inspectDedupFile } from '../src/dedup.ts';
+import { DedupError, DedupStore, buildNofollowOpenFlags, inspectDedupFile } from '../src/dedup.ts';
 import { canReplaceDedupTarget, inspectStateWritable } from '../src/readiness.ts';
 import {
   FIXTURE_SECRET,
@@ -26,7 +26,7 @@ import {
   testConfig,
   writeSecretFile,
 } from './helpers.ts';
-import type { Receiver } from '../src/server.ts';
+import { createReceiver, listenReceiver, type Receiver } from '../src/server.ts';
 
 const receivers: Receiver[] = [];
 afterEach(async () => {
@@ -246,5 +246,65 @@ describe('R21 non-loopback opt-in', () => {
     );
     receivers.push(open);
     expect(open.url()).toMatch(/^http:\/\/0\.0\.0\.0:\d+/);
+  });
+});
+
+
+describe('R1 O_NOFOLLOW fail-closed flag builder', () => {
+  test('负控：O_NOFOLLOW 缺失（undefined/非 number）即抛 dedup_unacked_symlink', () => {
+    expect(() => buildNofollowOpenFlags(constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC, undefined)).toThrow(
+      DedupError,
+    );
+    try {
+      buildNofollowOpenFlags(0, undefined);
+      throw new Error('expected throw');
+    } catch (err) {
+      expect(err).toBeInstanceOf(DedupError);
+      expect((err as DedupError).code).toBe('dedup_dir_fsync_failed');
+      expect((err as DedupError).message).toBe('dedup_unacked_symlink');
+    }
+    expect(() => buildNofollowOpenFlags(0, 'nofollow' as unknown)).toThrow(DedupError);
+    expect(() => buildNofollowOpenFlags(0, null)).toThrow(DedupError);
+  });
+
+  test('正控：注入合法 nofollow 数值时 flags 含该位', () => {
+    const fake = 0x20000;
+    expect(buildNofollowOpenFlags(0o1, fake)).toBe(0o1 | fake);
+    // 生产默认 constants.O_NOFOLLOW 必须可用（本 CI/Linux）
+    expect(typeof constants.O_NOFOLLOW).toBe('number');
+    expect(buildNofollowOpenFlags(constants.O_WRONLY) & constants.O_NOFOLLOW).toBe(constants.O_NOFOLLOW);
+  });
+});
+
+describe('R1 listenReceiver library non-loopback guard', () => {
+  test('负控：库调用绕过 parseFileConfig 时非 loopback 无 opt-in 仍拒绝 listen', async () => {
+    const dir = tempDir();
+    // 故意构造 programmatic config，跳过 parseFileConfig
+    const bypassed = testConfig(
+      { listen: { host: '0.0.0.0', port: 0, allowNonLoopback: false } },
+      dir,
+    );
+    const receiver = createReceiver(bypassed);
+    await expect(listenReceiver(receiver)).rejects.toThrow('config_invalid:listen.allowNonLoopback');
+    // 省略字段（undefined）同样视为 false；listen 未成功则勿 close（server 未 listen）
+    const omitted = testConfig({ listen: { host: '0.0.0.0', port: 0 } }, dir);
+    delete (omitted.listen as { allowNonLoopback?: boolean }).allowNonLoopback;
+    const r2 = createReceiver(omitted);
+    await expect(listenReceiver(r2)).rejects.toThrow('config_invalid:listen.allowNonLoopback');
+  });
+
+  test('正控：loopback 无 opt-in 可听；非 loopback + allowNonLoopback:true 可听', async () => {
+    const dir = tempDir();
+    const loop = createReceiver(testConfig({ listen: { host: '127.0.0.1', port: 0 } }, dir));
+    receivers.push(loop);
+    const url = await listenReceiver(loop);
+    expect(url.startsWith('http://127.0.0.1:')).toBe(true);
+
+    const open = createReceiver(
+      testConfig({ listen: { host: '0.0.0.0', port: 0, allowNonLoopback: true } }, dir),
+    );
+    receivers.push(open);
+    const openUrl = await listenReceiver(open);
+    expect(openUrl).toMatch(/^http:\/\/0\.0\.0\.0:\d+/);
   });
 });

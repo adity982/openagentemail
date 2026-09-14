@@ -4,7 +4,7 @@ import { createServer, type IncomingMessage, type Server, type ServerResponse } 
 import { createHttpAlert } from './alert.ts';
 import { canaryTerminalBound, findRoute, HTTP_HEADER_OVERHEAD_BYTES } from './config.ts';
 import { DedupError, DedupStore, dedupKey } from './dedup.ts';
-import { decodeRouteKey, isRouteKey, normalizeDomain, normalizeMailbox } from './ids.ts';
+import { decodeRouteKey, isLoopbackHost, isRouteKey, normalizeDomain, normalizeMailbox } from './ids.ts';
 import { logEvent } from './log.ts';
 import { buildNeutralWakeText, buildOrcaArgv } from './notify.ts';
 import { parseVerifiedEnvelope, readMailAddress, readMailMessageId, readPingWebhookId, type EnvelopeBase } from './parse.ts';
@@ -580,6 +580,11 @@ export function createReceiver(config: ReceiverConfig, hooks: ReceiverHooks = {}
 }
 
 export function listenReceiver(receiver: Receiver): Promise<string> {
+  // 库入口同款守卫：省略 allowNonLoopback 视为 false，禁止绕过 main/parseFileConfig
+  const { host, allowNonLoopback } = receiver.config.listen;
+  if (!isLoopbackHost(host) && allowNonLoopback !== true) {
+    return Promise.reject(new Error('config_invalid:listen.allowNonLoopback'));
+  }
   return new Promise((resolve, reject) => {
     receiver.server.once('error', reject);
     receiver.server.listen(receiver.config.listen.port, receiver.config.listen.host, () => {

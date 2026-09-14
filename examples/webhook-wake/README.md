@@ -77,10 +77,12 @@ tree.
   prerequisite is loopback listen and/or a reverse proxy that excludes
   public `/ready` (Caddy/nginx templates already omit it). This example
   does not add `/ready` authentication.
-  **Readiness IO is bounded:** path-depth walks are ancestor chains only
-  (no recursive tree scan), and `inspectDedupFile` stops after
-  `dedup.maxRecords` live entries — a single `/ready` inspect stays
-  microsecond-scale on a healthy private host. Identifiers on `/ready`
+  **Readiness IO:** path-depth walks are ancestor chains only (no
+  recursive tree scan). `inspectDedupFile` reads and parses the **entire**
+  dedup file then scans all records — cost is bounded by **on-disk file
+  size**, not by `dedup.maxRecords` (a formerly-large or corrupt file still
+  costs proportional to bytes on `/ready`; `maxRecords` only gates the
+  live-capacity ready bit after the full scan). Identifiers on `/ready`
   are deployment-private by the loopback/proxy prerequisite above, not
   by adding auth. **No TTL cache:** readiness must reflect the current
   sticky-dir / `.dirsync` / mapping truth before the next wake; a stale

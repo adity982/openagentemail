@@ -277,12 +277,25 @@ function fsyncDirectory(dir: string): void {
 export const DEDUP_TEMP_NAME_PREFIX = 'ww';
 export const FS_NAME_MAX_BYTES = 255;
 
+/**
+ * Fail-closed：平台无 O_NOFOLLOW 时禁止静默退化成可跟随写。
+ * 第二参可注入以便单测 stub；省略第二参时用 constants.O_NOFOLLOW。
+ * 注意：显式传入 undefined 不算「省略」（arguments.length>=2），须抛错，
+ * 避免 default 参数把缺失 stub 静默回落到生产常量。
+ */
+export function buildNofollowOpenFlags(baseFlags: number, nofollow?: unknown): number {
+  // 省略第二参 → 生产常量；显式 undefined/非 number → fail-closed
+  const flag = arguments.length >= 2 ? nofollow : constants.O_NOFOLLOW;
+  if (typeof flag !== 'number') {
+    throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_symlink');
+  }
+  return baseFlags | flag;
+}
+
 /** Exclusive create in `parent`. Not a complete shared-directory / TOCTOU defense. */
 function createExclusiveTemp(parent: string, prefix: string): { fd: number; path: string } {
-  let flags = constants.O_RDWR | constants.O_CREAT | constants.O_EXCL;
-  if (typeof constants.O_NOFOLLOW === 'number') {
-    flags |= constants.O_NOFOLLOW;
-  }
+  // openSync 之前强制 O_NOFOLLOW；缺失即抛，不静默退化
+  const flags = buildNofollowOpenFlags(constants.O_RDWR | constants.O_CREAT | constants.O_EXCL);
   let last: NodeJS.ErrnoException | undefined;
   for (let attempt = 0; attempt < 8; attempt++) {
     const name = `${prefix}.${randomBytes(16).toString('hex')}`;
@@ -506,13 +519,10 @@ export class DedupStore {
   }
 
   private markUnacked(): void {
-    // 与 persistUnacked 同款：同 fd O_NOFOLLOW，避免回收路径跟随 symlink
+    // 回收路径与 persistUnacked 同款：同 fd O_NOFOLLOW；无该旗则 fail-closed
     this.assertUnackedWritable();
     const marker = this.unackedPath();
-    let flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
-    if (typeof constants.O_NOFOLLOW === 'number') {
-      flags |= constants.O_NOFOLLOW;
-    }
+    const flags = buildNofollowOpenFlags(constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC);
     let fd: number;
     try {
       fd = openSync(marker, flags, 0o600);
@@ -538,11 +548,8 @@ export class DedupStore {
     }
     this.assertUnackedWritable();
     const marker = this.unackedPath();
-    // 同描述符非跟随写：避免 writeFileSync 后再 open 的 symlink-follow 窗
-    let flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
-    if (typeof constants.O_NOFOLLOW === 'number') {
-      flags |= constants.O_NOFOLLOW;
-    }
+    // 同描述符非跟随写；O_NOFOLLOW 缺失时 buildNofollowOpenFlags 已 fail-closed
+    const flags = buildNofollowOpenFlags(constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC);
     let fd: number;
     try {
       fd = openSync(marker, flags, 0o600);

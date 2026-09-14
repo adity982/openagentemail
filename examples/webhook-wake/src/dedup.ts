@@ -24,6 +24,7 @@ import {
   writeSync,
 } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { canReplaceDedupTarget } from './fs-replace.ts';
 import type { DedupConfig, DedupRecord } from './types.ts';
 
 export class DedupError extends Error {
@@ -89,12 +90,9 @@ export type DedupInspect =
 export function inspectRegularStateFile(path: string): 'missing' | 'file' | 'not_file' | 'unreadable' {
   try {
     const link = lstatSync(path);
+    // 永不跟随：symlink 视为非普通文件（与 FIFO 同属 fail-closed）
     if (link.isSymbolicLink()) {
-      try {
-        return statSync(path).isFile() ? 'file' : 'not_file';
-      } catch (err) {
-        return (err as NodeJS.ErrnoException).code === 'ENOENT' ? 'not_file' : 'unreadable';
-      }
+      return 'not_file';
     }
     return link.isFile() ? 'file' : 'not_file';
   } catch (err) {
@@ -155,6 +153,10 @@ export function inspectDedupFile(
     return { ok: false, reason: 'state_dirsync_unreadable' };
   }
   if (dirsyncKind === 'file') {
+    // sticky 外属 .dirsync 无法 unlink：wake 前 fail-closed，避免序颠倒
+    if (!canReplaceDedupTarget(dirsync)) {
+      return { ok: false, reason: 'state_dirsync_unreadable' };
+    }
     try {
       accessSync(dirsync, constants.R_OK);
     } catch {
@@ -483,17 +485,49 @@ export class DedupStore {
 
   /** Reject FIFO/dir/socket before a blocking writeFileSync on the marker. */
   private assertUnackedWritable(): void {
-    const kind = inspectRegularStateFile(this.unackedPath());
-    if (kind === 'missing' || kind === 'file') return;
-    if (kind === 'unreadable') {
+    // lstat：symlink 放行到 O_NOFOLLOW open（由 open 咬红）；FIFO/dir 仍拒
+    try {
+      const st = lstatSync(this.unackedPath());
+      if (st.isSymbolicLink()) return;
+      if (st.isFile()) {
+        try {
+          accessSync(this.unackedPath(), constants.R_OK | constants.W_OK);
+        } catch {
+          throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_unreadable');
+        }
+        return;
+      }
+      throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_not_file');
+    } catch (err) {
+      if (err instanceof DedupError) throw err;
+      if ((err as NodeJS.ErrnoException).code === 'ENOENT') return;
       throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_unreadable');
     }
-    throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_not_file');
   }
 
   private markUnacked(): void {
+    // 与 persistUnacked 同款：同 fd O_NOFOLLOW，避免回收路径跟随 symlink
     this.assertUnackedWritable();
-    writeFileSync(this.unackedPath(), 'unacked\n', { mode: 0o600 });
+    const marker = this.unackedPath();
+    let flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
+    if (typeof constants.O_NOFOLLOW === 'number') {
+      flags |= constants.O_NOFOLLOW;
+    }
+    let fd: number;
+    try {
+      fd = openSync(marker, flags, 0o600);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP' || code === 'EPERM') {
+        throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_symlink');
+      }
+      throw err;
+    }
+    try {
+      writeSync(fd, 'unacked\n');
+    } finally {
+      closeSync(fd);
+    }
   }
 
   /** File + parent-dir fsync so a crash after rename still sees the marker. */
@@ -504,9 +538,23 @@ export class DedupStore {
     }
     this.assertUnackedWritable();
     const marker = this.unackedPath();
-    writeFileSync(marker, 'unacked\n', { mode: 0o600 });
-    const fd = openSync(marker, 'r+');
+    // 同描述符非跟随写：避免 writeFileSync 后再 open 的 symlink-follow 窗
+    let flags = constants.O_WRONLY | constants.O_CREAT | constants.O_TRUNC;
+    if (typeof constants.O_NOFOLLOW === 'number') {
+      flags |= constants.O_NOFOLLOW;
+    }
+    let fd: number;
     try {
+      fd = openSync(marker, flags, 0o600);
+    } catch (err) {
+      const code = (err as NodeJS.ErrnoException).code;
+      if (code === 'ELOOP' || code === 'EPERM') {
+        throw new DedupError('dedup_dir_fsync_failed', 'dedup_unacked_symlink');
+      }
+      throw err;
+    }
+    try {
+      writeSync(fd, 'unacked\n');
       fsyncSync(fd);
     } finally {
       closeSync(fd);

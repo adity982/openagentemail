@@ -12,6 +12,7 @@ import {
   isTerminalHandle,
   normalizeDomain,
   normalizeMailbox,
+  isLoopbackHost,
 } from './ids.ts';
 import type { ReceiverConfig, ReceiverMode, RouteBinding } from './types.ts';
 
@@ -23,6 +24,10 @@ export const PRODUCER_RETRY_HORIZON_MS = 72 * 60 * 60 * 1000;
 export const RETENTION_DELIVERY_MARGIN_MS = 60 * 60 * 1000;
 export const MIN_RETENTION_MS = PRODUCER_RETRY_HORIZON_MS + RETENTION_DELIVERY_MARGIN_MS;
 export const DEFAULT_MAX_RECORDS = 10_000;
+/** README 推荐上沿：request/send ≤30s，alertHook ≤10s（防 setTimeout 32-bit 溢出）。 */
+export const MAX_REQUEST_TIMEOUT_MS = 30_000;
+export const MAX_SEND_TIMEOUT_MS = 30_000;
+export const MAX_ALERT_HOOK_TIMEOUT_MS = 10_000;
 /** Host/Content-Type/Content-Length and other non-signature request headers. */
 export const HTTP_HEADER_OVERHEAD_BYTES = 4096;
 
@@ -50,7 +55,7 @@ export type FileRouteSpec = {
 
 export type FileConfig = {
   /** Absent keeps 127.0.0.1:8787. A present non-object fails load. */
-  listen?: { host?: string; port?: number };
+  listen?: { host?: string; port?: number; allowNonLoopback?: unknown };
   /** Absent defaults to observe. A present invalid value fails load. */
   mode?: string;
   canaryTerminal?: string | null;
@@ -135,6 +140,14 @@ function optionalPositiveInt(value: unknown, field: string, fallback: number): n
   }
   return value;
 }
+function optionalPositiveIntWithMax(value: unknown, field: string, fallback: number, max: number): number {
+  const n = optionalPositiveInt(value, field, fallback);
+  if (n > max) {
+    throw new Error(`config_invalid:${field}`);
+  }
+  return n;
+}
+
 
 /** Zero is valid (history off, ephemeral listen port). */
 function optionalNonNegInt(value: unknown, field: string, fallback: number): number {
@@ -227,12 +240,12 @@ function requireDedupObject(
   return value as { path?: unknown; retentionMs?: number; maxRecords?: number };
 }
 
-function requireListenObject(value: unknown): { host?: unknown; port?: unknown } | undefined {
+function requireListenObject(value: unknown): { host?: unknown; port?: unknown; allowNonLoopback?: unknown } | undefined {
   if (value === undefined) return undefined;
   if (value == null || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('config_invalid:listen');
   }
-  return value as { host?: unknown; port?: unknown };
+  return value as { host?: unknown; port?: unknown; allowNonLoopback?: unknown };
 }
 
 /** Present value must be null or a nonempty terminal string, including observe. */
@@ -246,6 +259,14 @@ function optionalCanaryTerminal(value: unknown): string | null {
     throw new Error('config_invalid:canaryTerminal');
   }
   return terminal;
+}
+
+function optionalBool(value: unknown, field: string, fallback: boolean): boolean {
+  if (value === undefined) return fallback;
+  if (typeof value !== 'boolean') {
+    throw new Error(`config_invalid:${field}`);
+  }
+  return value;
 }
 
 function optionalListenHost(value: unknown, fallback: string): string {
@@ -335,13 +356,33 @@ export function parseFileConfig(raw: unknown, options?: { loadSecrets?: boolean 
   if (typeof alertUrl === 'string' && !alertUrl.trim()) {
     throw new Error('config_invalid:alertHook.url');
   }
+  // null 保持合法；非空必须是 http/https（其余 scheme 拒载）
+  if (typeof alertUrl === 'string') {
+    let parsedUrl: URL;
+    try {
+      parsedUrl = new URL(alertUrl);
+    } catch {
+      throw new Error('config_invalid:alertHook.url');
+    }
+    if (parsedUrl.protocol !== 'http:' && parsedUrl.protocol !== 'https:') {
+      throw new Error('config_invalid:alertHook.url');
+    }
+  }
   const dedup = requireDedupObject(parsed.dedup);
   const listen = requireListenObject(parsed.listen);
 
+  const listenHost = optionalListenHost(listen?.host, '127.0.0.1');
+  const allowNonLoopback = optionalBool(listen?.allowNonLoopback, 'listen.allowNonLoopback', false);
+  // 非 loopback 必须显式 opt-in，否则拒载
+  if (!isLoopbackHost(listenHost) && !allowNonLoopback) {
+    throw new Error('config_invalid:listen.allowNonLoopback');
+  }
+
   return {
     listen: {
-      host: optionalListenHost(listen?.host, '127.0.0.1'),
+      host: listenHost,
       port: optionalPort(listen?.port, 8787),
+      allowNonLoopback,
     },
     mode,
     canaryTerminal,
@@ -354,9 +395,9 @@ export function parseFileConfig(raw: unknown, options?: { loadSecrets?: boolean 
       assertHttpHeaderTransport(value);
       return value;
     })(),
-    requestTimeoutMs: optionalPositiveInt(parsed.requestTimeoutMs, 'requestTimeoutMs', 10_000),
+    requestTimeoutMs: optionalPositiveIntWithMax(parsed.requestTimeoutMs, 'requestTimeoutMs', 10_000, MAX_REQUEST_TIMEOUT_MS),
     maxConcurrent: optionalPositiveInt(parsed.maxConcurrent, 'maxConcurrent', 16),
-    sendTimeoutMs: optionalPositiveInt(parsed.sendTimeoutMs, 'sendTimeoutMs', 8_000),
+    sendTimeoutMs: optionalPositiveIntWithMax(parsed.sendTimeoutMs, 'sendTimeoutMs', 8_000, MAX_SEND_TIMEOUT_MS),
     outputCapBytes: optionalPositiveInt(parsed.outputCapBytes, 'outputCapBytes', 4096),
     wakeHistoryLimit: optionalNonNegInt(parsed.wakeHistoryLimit, 'wakeHistoryLimit', 0),
     dedup: {
@@ -366,7 +407,7 @@ export function parseFileConfig(raw: unknown, options?: { loadSecrets?: boolean 
     },
     alertHook: {
       url: alertUrl,
-      timeoutMs: optionalPositiveInt(hook?.timeoutMs, 'alertHook.timeoutMs', 2000),
+      timeoutMs: optionalPositiveIntWithMax(hook?.timeoutMs, 'alertHook.timeoutMs', 2000, MAX_ALERT_HOOK_TIMEOUT_MS),
     },
     routes,
   };

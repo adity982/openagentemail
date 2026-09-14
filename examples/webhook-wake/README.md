@@ -53,8 +53,10 @@ tree.
   stopping the unit signals every process in the service cgroup,
   including a `detached` orca child. Bare/manual `bun src/main.ts` has
   no cgroup — a parent SIGKILL can leave that detached child running.
-  This example does not add a PDEATHSIG wrapper; prefer the unit (or an
-  equivalent cgroup) in deployment.
+  The in-process kill path only signals `pid > 1 && pid !== self` of the
+  spawned job group; that is a PID-reuse footgun guard, not a substitute
+  for cgroup teardown. This example does not add a PDEATHSIG wrapper;
+  prefer the unit (or an equivalent cgroup) in deployment.
 - The child inherits a runtime allowlist (`HOME`, `USER`, `XDG_*`, `PATH`)
   so a colocated Orca install can resolve its files. API credentials and
   secrets are not forwarded. Placeholder operator identity is **ops** in
@@ -74,14 +76,25 @@ tree.
   Unauthenticated readiness is **intentional**. The private-deployment
   prerequisite is loopback listen and/or a reverse proxy that excludes
   public `/ready` (Caddy/nginx templates already omit it). This example
-  does not add `/ready` authentication. Synchronous IO and identifier
-  exposure on this path are deferred to issue
-  https://github.com/openagentemail/openagentemail/issues/177.
+  does not add `/ready` authentication.
+  **Readiness IO is bounded:** path-depth walks are ancestor chains only
+  (no recursive tree scan), and `inspectDedupFile` stops after
+  `dedup.maxRecords` live entries — a single `/ready` inspect stays
+  microsecond-scale on a healthy private host. Identifiers on `/ready`
+  are deployment-private by the loopback/proxy prerequisite above, not
+  by adding auth. **No TTL cache:** readiness must reflect the current
+  sticky-dir / `.dirsync` / mapping truth before the next wake; a stale
+  cached `ready: true` would re-introduce the wake-then-503 inversion
+  this hardening closes, so this example deliberately does not cache.
+  (Hardening tracked as https://github.com/openagentemail/openagentemail/issues/177.)
   Caddy/nginx templates proxy `/health` and `/hooks/*` only. Binding a
-  non-loopback listen address logs `listen_not_loopback` (no secrets).
+  non-loopback listen address requires explicit
+  `listen.allowNonLoopback: true` at load time (`config_invalid:listen.allowNonLoopback`
+  otherwise); loopback remains the default.
   Unknown hook routes return **404**; a known route with a failed
   signature returns **401**. Route keys are not credentials; the
   distinction is intentional and is not an authentication system.
+  If a route key later gains authorization weight, revisit this split.
 -   Dedup fsyncs the file and the parent directory after rename, including
   first directory creation. The commit temp file is created exclusively
   (`O_CREAT|O_EXCL|O_NOFOLLOW`) with a short independent prefix (`ww.<hex>`)
@@ -184,20 +197,23 @@ tree.
   then `limit_req zone=webhook_wake burst=20 nodelay;` **inside**
   `location /hooks/` (not beside `/health`). `/health` stays unthrottled.
   This tree does **not** invent a Caddy rate-limit module directive.
-  Non-loopback bind already logs `listen_not_loopback` (no new limiter).
-  Route 404 vs 401 stays a documented non-secret distinction. `alertHook.url`
-  remains trusted-operator config (no new scheme allowlist). Timer overflow
-  stays documented; commander 1823 accepted README ranges without new
-  load-time caps.
+  Non-loopback bind requires `listen.allowNonLoopback: true` (load-time
+  reject otherwise; no new request limiter). Route 404 vs 401 stays a
+  documented non-secret distinction. `alertHook.url` still trusts the
+  operator for reachability, but load accepts only `http:`/`https:`
+  (`config_invalid:alertHook.url` for other schemes). Timer values are
+  load-capped to the recommended bands below (and far below 2^31−1).
 
-## Recommended numeric ranges (guidance, not newly enforced)
+## Recommended numeric ranges (load-enforced where noted)
 
-These ranges describe operator defaults and current load-time constraints.
-They are **not** a new validation layer. Present values must already be
-integers of the documented sign; only `listen.port` (0–65535),
-`dedup.retentionMs` (≥72h + 1h delivery margin), and `dedup.path` (absolute) have extra load
-rules today. Do not treat the recommended bands below as runtime-enforced
-limits.
+These ranges describe operator defaults and load-time constraints.
+Present values must already be integers of the documented sign.
+Extra load rules today: `listen.port` (0–65535), `dedup.retentionMs`
+(≥72h + 1h delivery margin), `dedup.path` (absolute),
+`requestTimeoutMs` / `sendTimeoutMs` / `alertHook.timeoutMs` (positive
+integers capped at the recommended upper band), `alertHook.url`
+(`http:`/`https:` or `null`), and `listen.allowNonLoopback` (required
+`true` when `listen.host` is not loopback).
 
 | Field | Default | Current load rule | Recommended band | Runtime / misconfig note |
 | --- | --- | --- | --- | --- |
@@ -206,15 +222,15 @@ limits.
 | `timestampToleranceSec` | 300 | integer > 0 | 60–600 | Replay window. Large values accept stale signatures. |
 | `maxV1Signatures` | 8 | integer > 0 | 2–16 | Rotation candidates. Too low rejects a valid current+previous header. |
 | `maxHeaderBytes` | 2048 | integer > 0 | 2048–8192 | **UTF-8 byte** length (`Buffer.byteLength`). The parser and `createServer({ maxHeaderSize })` use `maxHeaderBytes + 4096` so other request headers fit. If that total exceeds the process `http.maxHeaderSize` (Bun default 16384), **load fails** (`config_invalid:maxHeaderBytes_exceeds_transport`). Raise the runtime (`bun --max-http-header-size=…`) before promising a larger signature. Too small → 401 `invalid_header`. |
-| `requestTimeoutMs` | 10000 | integer > 0 | 2000–30000 | Aborts an unfinished **HTTP body read** and frees the concurrent slot. Does not kill an already-spawned Orca child. |
+| `requestTimeoutMs` | 10000 | integer 1–30000 | 2000–30000 | Aborts an unfinished **HTTP body read** and frees the concurrent slot. Does not kill an already-spawned Orca child. |
 | `maxConcurrent` | 16 | integer > 0 | 1–64 | In-flight HTTP cap. `0` fails load. Too low → 503 `busy`. |
-| `sendTimeoutMs` | 8000 | integer > 0 | 1000–30000 | SIGKILL of the **spawned job process group** after this budget. Independent of `requestTimeoutMs`. Too small → 503 `timeout_killed`. |
+| `sendTimeoutMs` | 8000 | integer 1–30000 | 1000–30000 | SIGKILL of the **spawned job process group** after this budget. Independent of `requestTimeoutMs`. Too small → 503 `timeout_killed`. |
 | `outputCapBytes` | 4096 | integer > 0 | 1024–16384 | Bound on **retained** child stdout/stderr counts. Excess is drained and discarded (not pipe-destroyed) so a zero-exit send still commits. |
 | `wakeHistoryLimit` | 0 | integer ≥ 0 | 0–128 | In-memory ring only. `0` disables history. |
 | `dedup.path` | `/var/lib/webhook-wake/dedup.json` | absolute file path | absolute file path | Relative paths, trailing separators (`/tmp/x.json/`), and root-as-file (`/`) fail load (`config_invalid:dedup.path`) before any store I/O. Present `dedup` must be an object (`config_invalid:dedup`). |
 | `dedup.retentionMs` | 604800000 (7d) | integer ≥ 262800000 (72h + 1h) | 73h–30d | Replay/dedup window. Must outlast the producer's pinned 11th attempt at +72h; exactly 72h fails load so ordinary delivery latency cannot expire the record and re-wake. |
 | `dedup.maxRecords` | 10000 | integer > 0 | 1000–100000 | Fail-closed when full (no eviction of live keys). |
-| `alertHook.timeoutMs` | 2000 | integer > 0 | 500–10000 | Receiver hook POST budget only. |
+| `alertHook.timeoutMs` | 2000 | integer 1–10000 | 500–10000 | Receiver hook POST budget only. |
 
 External monitor timers (templates, not JSON config): probe interval **30s**,
 `FAIL_THRESHOLD` **2**, `COOLDOWN_SEC` **300**, curl `--max-time` **5**,
@@ -239,25 +255,22 @@ either far below the other does not compensate: a late body can still
 complete a wake if the request already passed to send, and a tiny send
 budget kills a healthy child while the HTTP slot is still open.
 
-**Runtime timer range (not a new config ceiling):**
+**Runtime timer range + load-time caps:**
 `requestTimeoutMs`, `sendTimeoutMs`, and `alertHook.timeoutMs` are passed
 to `setTimeout` (and `requestTimeoutMs` also to `http.Server.requestTimeout`
 / `headersTimeout`). Node.js timers
 (https://nodejs.org/docs/latest-v22.x/api/timers.html#settimeoutcallback-delay-args)
 keep `delay` in a signed 32-bit millisecond range. If `delay` is larger
 than **2147483647** (~24.8 days), the runtime sets the duration to
-**1 ms** and emits `TimeoutOverflowWarning` (observed on this
-workspace's Bun 1.3.14 and Node v24.5.0; `_idleTimeout` becomes 1).
-Values below 1 (including Bun `delay=0`) are also clamped to **1 ms**;
-Bun 0 does that **without** `TimeoutOverflowWarning`. This example
-does **not** add a load-time cap. A huge integer is **not** a reliable
-multi-day HTTP, send, or alert timer — it can fire almost immediately.
-Stay in the recommended second-to-tens-of-seconds bands, far below
-2^31−1. `dedup.retentionMs`
+**1 ms** and emits `TimeoutOverflowWarning`. This example now **rejects
+at load** any value above the recommended upper band
+(`requestTimeoutMs`/`sendTimeoutMs` ≤ 30000,
+`alertHook.timeoutMs` ≤ 10000; `config_invalid:<field>`), which also
+covers the >2^31−1 overflow case. Caps match the README recommended
+bands (not an arbitrary multiple of the default). `dedup.retentionMs`
 and `timestampToleranceSec` are wall-clock comparisons, not
-`setTimeout`, so a 7d–30d retention does not use this clamp. Monitor
-`COOLDOWN_SEC` / systemd `OnUnitActiveSec` are shell/unit seconds, not
-JS timers.
+`setTimeout`. Monitor `COOLDOWN_SEC` / systemd `OnUnitActiveSec` are
+shell/unit seconds, not JS timers.
 
 **Deploy verification:** `bun src/main.ts --config <file>` starts a
 **persistent listener**. It does **not** exit 0 after a successful bind.
@@ -280,14 +293,16 @@ is allowed in preflight; a real load still fails on a missing file.
 `alertHook`, if present, must be an object (string/array/null/scalar
 fail load) so a typo cannot silently disable the sink. `alertHook.url`
 `null` disables the sink; an explicit empty string fails load
-(`config_invalid:alertHook.url`). A present `canaryTerminal` must be
+(`config_invalid:alertHook.url`). A non-null URL must parse as
+`http:` or `https:` (other schemes fail load with the same code). A present `canaryTerminal` must be
 `null` or a nonempty valid terminal handle, including observe mode
 (`false` / `0` / `""` / whitespace fail load). Absent or `null` means
 no canary. Canary mode still requires a bound terminal. The JSON document root must be a
 non-array object (`config_invalid:root`); an array, scalar, or `null`
 root does not load as empty defaults. Present `listen` must be a non-array
 object; a present invalid `host` fails (`config_invalid:listen.host`)
-instead of silently binding `127.0.0.1`. Present `dedup`
+instead of silently binding `127.0.0.1`. A non-loopback `host` requires
+`allowNonLoopback: true` or load fails (`config_invalid:listen.allowNonLoopback`). Present `dedup`
 must likewise be an object (`config_invalid:dedup`). IPv6 listen
 addresses are bracketed in `receiver.url()` (`http://[::1]:port`).
 `httpProbe` strips those brackets before `http.request` so a

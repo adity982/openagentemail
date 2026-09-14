@@ -104,7 +104,19 @@
       await task;
     } catch (error) {
       if (error.name !== 'AbortError' && error.message !== 'session_expired') {
-        messageState.textContent = 'Messages could not be loaded. Try Refresh.';
+        // #196 / R3：仅 load-more（opts.more）上的 invalid_cursor 清 stale nextCursor；
+        // 首页/Refresh 无 cursor 时缺 UIDVALIDITY 也会返 invalid_cursor，不得误提示分页过期。
+        if (
+          opts.more === true &&
+          error.status === 400 &&
+          error.body &&
+          error.body.error === 'invalid_cursor'
+        ) {
+          state.nextCursor = '';
+          messageState.textContent = 'Pagination expired. Press Refresh to load the latest page.';
+        } else {
+          messageState.textContent = 'Messages could not be loaded. Try Refresh.';
+        }
       }
     } finally {
       if (refreshTask === task) refreshTask = null;

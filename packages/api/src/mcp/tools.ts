@@ -649,12 +649,31 @@ export function registerOpenAgentEmailTools(
       outputSchema: taskOutputSchema,
       annotations: mutatingAnnotations,
     },
-    ({ to, subject, body, kind, approval, wait, parentTaskId }) => callApi(() => {
-      if (kind === 'approval' && approval) {
-        return client.createApprovalTask(to, subject, approval.action, approval.expiresAt, body, wait ?? false, parentTaskId);
+    ({ to, subject, body, kind, approval, wait, parentTaskId }) => callApi(async () => {
+      try {
+        if (kind === 'approval' && approval) {
+          return await client.createApprovalTask(to, subject, approval.action, approval.expiresAt, body, wait ?? false, parentTaskId);
+        }
+        if (kind === 'approval' || approval || body === undefined) {
+          throw new Error('approval task_create requires approval; ordinary task_create requires body');
+        }
+        return await client.createTask(to, subject, body, wait ?? false, parentTaskId);
+      } catch (err) {
+        // 仅 task_create：已创建后失败补安全重试口径；其他工具不受 fail() 全局耦合。
+        if (err instanceof ApiError && err.taskId) {
+          throw new ApiError(
+            err.status,
+            `${err.message} taskId=${err.taskId}. Task already created — use task_get or task_list to check status; do not call task_create again.`,
+            err.timeoutSec,
+            err.kind,
+            err.waitHeaderSec,
+            err.bodyError,
+            err.errorBody,
+            err.taskId,
+          );
+        }
+        throw err;
       }
-      if (kind === 'approval' || approval || body === undefined) throw new Error('approval task_create requires approval; ordinary task_create requires body');
-      return client.createTask(to, subject, body, wait ?? false, parentTaskId);
     }),
   );
 

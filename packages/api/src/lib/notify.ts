@@ -17,6 +17,7 @@ import {
   appendNotificationLog,
   logicalChannelFor,
   notificationLogHealthAlert,
+  inspectLegacyLocalpartOwnerEvidence,
   type NotificationLogicalChannel,
   type NotificationLogicalTarget,
   type NotificationSource,
@@ -47,6 +48,9 @@ export type NotifyTopic = 'self' | 'user-alerts' | 'user-low' | `agent:${string}
  *   silently cut the body and return 200).
  */
 export type NotifyOverflow = 'truncate' | 'error';
+
+/** 旧 localpart 键属主烙印：完整地址，或 ambiguous（拒绝回退）。 */
+export const LEGACY_OWNER_AMBIGUOUS = 'ambiguous';
 
 export interface NotifyInput {
   target: NotifyTarget;
@@ -129,6 +133,7 @@ export class NotifyError extends Error {
       | 'notify_cancelled'
       | 'verify_failed'
       | 'unknown_agent'
+      | 'invalid_agent_name'
       | 'message_too_large'
       | 'device_registry_unavailable',
     public readonly details?: {
@@ -169,6 +174,11 @@ type Reader = {
 type Route = {
   topic: string;
   reader: Reader;
+  /**
+   * 仅旧裸 localpart 键使用：属主完整地址，或 LEGACY_OWNER_AMBIGUOUS。
+   * 完整地址键不写此字段。
+   */
+  ownerAddress?: string;
 };
 
 type NotifyState = {
@@ -182,7 +192,9 @@ type NotifyState = {
 
 const TOKEN_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
 const SUFFIX_ALPHABET = TOKEN_ALPHABET;
-const TOPIC_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+/** 裸 localpart（旧键）或完整地址（新键）；与 routes/notify 目标口径对齐。 */
+const AGENT_ROUTE_KEY_RE =
+  /^[a-z0-9][a-z0-9._-]{0,62}(?:@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*)?$/;
 // ntfy's public topic grammar is stricter than our valid identity localparts:
 // it has no dots and caps a topic at 64 characters.
 const NTFY_TOPIC_RE = /^[-_A-Za-z0-9]{1,64}$/;
@@ -203,9 +215,19 @@ function statePath(): string {
   return join(dirname(config.ntfy.configPath), 'notifications.json');
 }
 
+/** 键化用：小写；仅完整地址（含 @）才剥域名尾点，裸 localpart 如 fox. 原样保留。 */
+export function canonicalizeAgentAddress(address: string): string {
+  const lower = address.toLowerCase().trim();
+  if (lower.includes('@')) return lower.replace(/\.+$/, '');
+  return lower;
+}
+
 function safeAgentName(value: string): string {
-  const normalized = value.toLowerCase();
-  if (!TOPIC_NAME_RE.test(normalized)) throw new Error('invalid_agent_name');
+  const normalized = canonicalizeAgentAddress(value);
+  // 完整地址最长按邮箱惯例封顶；非法/超长映射既有 NotifyError，避免裸 Error→500。
+  if (normalized.length > 254 || !AGENT_ROUTE_KEY_RE.test(normalized)) {
+    throw new NotifyError('invalid_agent_name');
+  }
   return normalized;
 }
 
@@ -223,9 +245,8 @@ export function physicalAgentTopic(name: string, suffix: string): string {
     return direct;
   }
 
-  // Keep the logical route as agent:<localpart>; only this private physical
-  // name is normalized. The hash avoids collisions after dot replacement or
-  // truncation, and the arithmetic below keeps the topic within 64 chars.
+  // 逻辑路由可为 agent:<full-address>；仅此私有物理名做规范化。
+  // hash 避免点替换/截断后碰撞；下方算术保证 topic ≤64 字。算法本身不得改。
   const normalized = name.replace(/[^a-z0-9_-]/g, '-').replace(/-+/g, '-').replace(/^[-_]+|[-_]+$/g, '') || 'agent';
   const fragment = normalized.slice(0, 44);
   return `agent-${fragment}-${shortHash(name)}-${suffix}`;
@@ -278,7 +299,9 @@ function isReader(value: unknown): value is Reader {
 function isRoute(value: unknown): value is Route {
   if (!value || typeof value !== 'object') return false;
   const entry = value as Record<string, unknown>;
-  return typeof entry.topic === 'string' && isReader(entry.reader);
+  if (typeof entry.topic !== 'string' || !isReader(entry.reader)) return false;
+  if (entry.ownerAddress !== undefined && typeof entry.ownerAddress !== 'string') return false;
+  return true;
 }
 
 function isState(value: unknown): value is NotifyState {
@@ -319,10 +342,45 @@ function loadState(): NotifyState {
   try {
     const parsed = JSON.parse(readFileSync(path, 'utf8'));
     if (!isState(parsed)) throw new Error('invalid notification store shape');
+    // 旧裸 localpart 键烙印属主，防止删身份后跨域复用误绑残留 topic。
+    try {
+      if (stampLegacyAgentOwners(parsed)) {
+        writePrivate(path, JSON.stringify(parsed, null, 2));
+      }
+    } catch {
+      // 烙印失败不阻断加载；下次 load 再试。
+    }
     return parsed;
   } catch {
     throw new Error('notification_store_corrupt');
   }
+}
+
+/**
+ * 给尚未烙印的旧 localpart 键写入 ownerAddress。
+ * 唯一持有者且 notification-log 无冲突属主证据 → 烙印；否则 ambiguous。已烙印不覆盖。
+ */
+function stampLegacyAgentOwners(state: NotifyState): boolean {
+  let changed = false;
+  const identities = listIdentities();
+  for (const [key, entry] of Object.entries(state.agents)) {
+    if (key.includes('@')) continue;
+    if (entry.ownerAddress !== undefined) continue;
+    const holders = identities.filter(
+      (i) => i.address.split('@')[0].toLowerCase() === key.toLowerCase(),
+    );
+    if (holders.length !== 1) {
+      entry.ownerAddress = LEGACY_OWNER_AMBIGUOUS;
+      changed = true;
+      continue;
+    }
+    const candidate = canonicalizeAgentAddress(holders[0]!.address);
+    const evidence = inspectLegacyLocalpartOwnerEvidence(key, candidate);
+    entry.ownerAddress =
+      evidence === 'conflict' ? LEGACY_OWNER_AMBIGUOUS : candidate;
+    changed = true;
+  }
+  return changed;
 }
 
 function saveState(state: NotifyState): void {
@@ -399,17 +457,61 @@ export function setNotificationAgentRouteForTests(agent: string, route: Route | 
   else delete cachedState.agents[agent];
 }
 
+/** @internal 测试缝：读取内存中的 agent 路由键（完整地址或旧 localpart）。 */
+export function getNotificationAgentRouteForTests(agent: string): Route | undefined {
+  if (!cachedState) cachedState = loadState();
+  return cachedState.agents[agent];
+}
+
+/** @internal 测试缝：对内存态补跑旧键属主烙印。 */
+export function runLegacyOwnerStampForTests(): void {
+  if (!cachedState) cachedState = loadState();
+  stampLegacyAgentOwners(cachedState);
+}
+
 async function state(): Promise<NotifyState> {
   if (!cachedState) cachedState = loadState();
   return cachedState;
 }
 
+/**
+ * 解析 agent 路由：先精确命中（完整地址键），miss 再回退旧 localpart 键。
+ * 裸 localpart 且无旧键时 fail-closed（unknown_agent），要求调用方改用完整地址。
+ * 旧键回退须匹配 ownerAddress 烙印，ambiguous/错属主一律拒绝。
+ * 裸 localpart 精确命中同样要求 ownerAddress 非 ambiguous（纵深 fail-closed）。
+ */
 async function existingAgentRoute(name: string): Promise<Route> {
   const agent = safeAgentName(name);
   const current = await state();
-  const existing = current.agents[agent];
-  if (!isUsableAgentRoute(existing)) throw new NotifyError('unknown_agent');
-  return existing;
+  const exact = current.agents[agent];
+  if (isUsableAgentRoute(exact)) {
+    // 完整地址键直接可用；裸 localpart 键须已烙印且非 ambiguous。
+    if (!agent.includes('@')) {
+      if (
+        exact.ownerAddress === undefined ||
+        exact.ownerAddress === LEGACY_OWNER_AMBIGUOUS
+      ) {
+        throw new NotifyError('unknown_agent');
+      }
+    }
+    return exact;
+  }
+  // 仅完整地址 miss 时回退 localpart，兼容未迁移的旧键。
+  if (agent.includes('@')) {
+    const localpart = agent.split('@')[0];
+    if (localpart) {
+      const fallback = current.agents[localpart];
+      if (
+        isUsableAgentRoute(fallback) &&
+        fallback.ownerAddress !== undefined &&
+        fallback.ownerAddress !== LEGACY_OWNER_AMBIGUOUS &&
+        fallback.ownerAddress === agent
+      ) {
+        return fallback;
+      }
+    }
+  }
+  throw new NotifyError('unknown_agent');
 }
 
 function priority(level: NotifyLevel): number {
@@ -430,8 +532,9 @@ async function readableTopic(topic: NotifyTopic, identityAddress?: string): Prom
   const current = await state();
   if (topic === 'user-alerts') return current.userAlerts.topic;
   if (topic === 'user-low') return current.userLow.topic;
+  // self 用完整地址键（去尾点）；existingAgentRoute 会在属主匹配时回退旧 localpart 键。
   const agent = topic === 'self'
-    ? identityAddress?.split('@')[0]
+    ? (identityAddress ? canonicalizeAgentAddress(identityAddress) : undefined)
     : topic.slice('agent:'.length);
   if (!agent) throw new Error('invalid_notify_topic');
   return (await existingAgentRoute(agent)).topic;
@@ -1044,8 +1147,9 @@ export function notificationService(): NtfyNotificationService {
 export async function provisionIdentityNotifications(identity: Identity): Promise<void> {
   if (!config.ntfy.enabled) return;
   if (!config.ntfy.adminPassword) throw new NotifyError('notifications_unconfigured');
-  const agent = identity.address.split('@')[0];
-  if (!agent) throw new NotifyError('unknown_agent');
+  // 新身份一律以完整地址（小写、去尾点）为 agents 键；不因旧 localpart 键存在而跳过。
+  const agent = canonicalizeAgentAddress(identity.address);
+  if (!agent.includes('@')) throw new NotifyError('unknown_agent');
 
   const current = await state();
   const existing = current.agents[agent];
@@ -1090,18 +1194,18 @@ export async function notifyTrustedAgentDelivery(address: string): Promise<void>
   if (!config.ntfy.enabled || config.ntfy.pushPolicy === 'none') return;
   const identity = findIdentity(address);
   if (!identity) return;
-  const localpart = identity.address.split('@')[0];
-  if (!localpart) return;
+  const fullAddress = canonicalizeAgentAddress(identity.address);
+  if (!fullAddress.includes('@')) return;
 
   try {
     await notificationService().publish({
-      target: `agent:${localpart}`,
+      target: `agent:${fullAddress}`,
       title: 'openagent.email new mail',
       message: `${identity.address} received new email`,
       level: 'normal',
       tags: ['email'],
       source: 'task',
-      logicalChannel: `agent:${localpart}`,
+      logicalChannel: `agent:${fullAddress}`,
       sensitive: false,
       identityAddress: identity.address,
     });
@@ -1120,9 +1224,18 @@ export async function initializeNotifications(): Promise<void> {
   // ntfy boots. These private routes remain server-only; phone pairing grants
   // a separate account only to the two human topics.
   for (const identity of listIdentities()) {
-    const agent = identity.address.split('@')[0];
-    if (!agent || isUsableAgentRoute(current.agents[agent])) continue;
-    current.agents[agent] = agentRoute(agent, current.suffix);
+    const fullKey = canonicalizeAgentAddress(identity.address);
+    const localpart = fullKey.split('@')[0];
+    if (!fullKey.includes('@')) continue;
+    // 已有完整地址键 → 跳过。
+    if (isUsableAgentRoute(current.agents[fullKey])) continue;
+    // 旧 localpart 键仅当烙印属主就是本身份时视为已 provision（不重写）。
+    if (localpart && isUsableAgentRoute(current.agents[localpart])) {
+      const legacy = current.agents[localpart]!;
+      if (legacy.ownerAddress === fullKey) continue;
+    }
+    // 写入只写完整地址键；旧 localpart 键原地保留。
+    current.agents[fullKey] = agentRoute(fullKey, current.suffix);
     changed = true;
   }
   if (changed) saveState(current);

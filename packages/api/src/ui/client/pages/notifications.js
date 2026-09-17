@@ -35,13 +35,20 @@
     ].join('|');
   }
 
+  /* 完整地址键化：小写；含 @ 才剥域名尾点（与服务端 canonicalizeAgentAddress 一致）。 */
+  function canonicalizeAgentAddress(address) {
+    var lower = String(address || '').toLowerCase().trim();
+    if (lower.indexOf('@') !== -1) return lower.replace(/\.+$/, '');
+    return lower;
+  }
+
   /* 本会话允许查询的逻辑 topic：identity 只打 self；admin 用 identities 派生，不另开列表 API。 */
   function notifyTopicsForSession() {
     if (!isAdmin()) return ['self'];
     var topics = ['user-alerts', 'user-low'];
     state.identities.forEach(function (identity) {
-      var localpart = identity.address.split('@')[0];
-      if (localpart) topics.push('agent:' + localpart);
+      // 频道键用完整地址，与 agents 新键口径一致。
+      if (identity.address) topics.push('agent:' + canonicalizeAgentAddress(identity.address));
     });
     return topics;
   }
@@ -89,9 +96,8 @@
       notifyTopicFilter.append(option);
     });
     state.identities.forEach(function (identity) {
-      var localpart = identity.address.split('@')[0];
-      if (!localpart) return;
-      var topic = 'agent:' + localpart;
+      if (!identity.address) return;
+      var topic = 'agent:' + canonicalizeAgentAddress(identity.address);
       var option = document.createElement('option');
       option.value = topic;
       option.textContent = topic;
@@ -526,9 +532,9 @@
           failures += 1;
           return;
         }
-        /* identity 的 self 在 UI 上标成 agent:<localpart>，不暴露 self 别名。 */
+        /* identity 的 self 在 UI 上标成 agent:<full-address>，不暴露 self 别名。 */
         var displayTopic = batch.topic === 'self' && state.me && state.me.address
-          ? 'agent:' + state.me.address.split('@')[0]
+          ? 'agent:' + canonicalizeAgentAddress(state.me.address)
           : batch.topic;
         batch.messages.forEach(function (message) {
           merged.push({

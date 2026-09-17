@@ -458,7 +458,7 @@ export function registerOpenAgentEmailTools(
     {
       title: "Mark Email Seen",
       description:
-        "Mark a message as read (seen=true) or unread (seen=false). Call this after processing a message so the unseen count reflects what is still unhandled. Reading a message never changes this flag by itself.",
+        "Mark a message as read (seen=true) or unread (seen=false). This flag is shared across all consumers of the mailbox — agents that only need new-mail detection should prefer GET /v1/messages?since= or mail_wait_for. Reading a message never changes this flag by itself.",
       inputSchema: {
         ...receivedMessageInputSchema,
         seen: z
@@ -482,7 +482,7 @@ export function registerOpenAgentEmailTools(
     {
       title: "Wait for Email",
       description:
-        "Wait for an incoming message matching optional from/subject filters. Returns the full message (with OTP codes/links) or a timeout error." +
+        "Wait for an incoming message matching optional from/subject filters; skips already-seen matches in the newest-20 window and keeps waiting until a true timeout or a new unread match. Returns the full message (with OTP codes/links) or a timeout error." +
         UNTRUSTED_CONTENT_DESCRIPTION,
       inputSchema: {
         address: identityAddressSchema.describe("Full email address of the identity to watch"),
@@ -573,12 +573,16 @@ export function registerOpenAgentEmailTools(
     {
       title: "Notify Agent",
       description:
-        "Wake a named agent through the server-side notification route. The server owns topics and credentials; pass the target agent's identity localpart only.",
+        "Wake a named agent through the server-side notification route. Prefer the target agent's full identity address (localpart@domain); bare localpart remains compatible for legacy single-domain deployments. The server owns topics and credentials.",
       inputSchema: {
         name: z
           .string()
-          .regex(/^[a-z0-9][a-z0-9._-]{0,62}$/)
-          .describe("Target agent identity localpart, for example qa-bot"),
+          .regex(
+            /^[a-z0-9][a-z0-9._-]{0,62}(?:@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*)?$/,
+          )
+          .describe(
+            "Target agent full address preferred (e.g. qa-bot@example.com); bare localpart (e.g. qa-bot) for legacy single-domain",
+          ),
         ...notificationInputSchema,
       },
       outputSchema: notifyOutputSchema,
@@ -645,12 +649,31 @@ export function registerOpenAgentEmailTools(
       outputSchema: taskOutputSchema,
       annotations: mutatingAnnotations,
     },
-    ({ to, subject, body, kind, approval, wait, parentTaskId }) => callApi(() => {
-      if (kind === 'approval' && approval) {
-        return client.createApprovalTask(to, subject, approval.action, approval.expiresAt, body, wait ?? false, parentTaskId);
+    ({ to, subject, body, kind, approval, wait, parentTaskId }) => callApi(async () => {
+      try {
+        if (kind === 'approval' && approval) {
+          return await client.createApprovalTask(to, subject, approval.action, approval.expiresAt, body, wait ?? false, parentTaskId);
+        }
+        if (kind === 'approval' || approval || body === undefined) {
+          throw new Error('approval task_create requires approval; ordinary task_create requires body');
+        }
+        return await client.createTask(to, subject, body, wait ?? false, parentTaskId);
+      } catch (err) {
+        // 仅 task_create：已创建后失败补安全重试口径；其他工具不受 fail() 全局耦合。
+        if (err instanceof ApiError && err.taskId) {
+          throw new ApiError(
+            err.status,
+            `${err.message} taskId=${err.taskId}. Task already created — use task_get or task_list to check status; do not call task_create again.`,
+            err.timeoutSec,
+            err.kind,
+            err.waitHeaderSec,
+            err.bodyError,
+            err.errorBody,
+            err.taskId,
+          );
+        }
+        throw err;
       }
-      if (kind === 'approval' || approval || body === undefined) throw new Error('approval task_create requires approval; ordinary task_create requires body');
-      return client.createTask(to, subject, body, wait ?? false, parentTaskId);
     }),
   );
 

@@ -119,12 +119,12 @@ describe('UI real-file manifest (#520-A)', () => {
       new Bun.CryptoHasher('sha256')
         .update(Buffer.from(s, 'utf8'))
         .digest('hex');
-    // #196 / R3：refreshMessages invalid_cursor 仅 opts.more 恢复；更新前已确认差异有意。
+    // #134、#196/R3 与 #231 Connect 页面均为有意 UI 变更；更新前已确认差异有意。
     expect(sha256(UI_JS)).toBe(
-      '622e10f6f5a662f89bc9b969de492249021f4c5f21bfe9a7ec145dd5e5ee1358',
+      'cb42dfe00e5052383ce21749dddc517b2f496eaacfc731f6fb5a14be47bace65',
     );
     expect(sha256(UI_CSS)).toBe(
-      '1379a8221bc82cbf2efb676d2f9b27308241cd62102cb122c1f251fa41c21c10',
+      '696f10717a3b159518dcc9bd1fbe6ac801c3891ff12066b605e1e6f8b97add3b',
     );
   });
 });

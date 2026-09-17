@@ -8,7 +8,6 @@ import {
   findIdentity,
   listIdentities,
   LOCALPART_RE,
-  LocalpartConflictError,
   PUSH_TIER3_WARNING,
   resolvePushContentTier,
   rotateIdentityToken,
@@ -21,6 +20,7 @@ import { recordAuditEvent } from '../lib/audit.ts';
 import { clientIp } from '../lib/net.ts';
 import {
   NotifyError,
+  canonicalizeAgentAddress,
   createNotificationDevice,
   listNotificationDevices,
   notificationService,
@@ -99,18 +99,21 @@ import {
 /**
  * 与 routes/notify.ts#toTopic 必须保持同一口径（Dashboard cookie 入口的镜像校验）。
  * 若改一侧，另一侧同步；抽出共享 helper 前先靠注释钉死。
+ * 允许裸 localpart（旧）或完整地址（新）。
  */
-const AGENT_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+const AGENT_NAME_RE =
+  /^[a-z0-9][a-z0-9._-]{0,62}(?:@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*)?$/;
 
 const notifyHistoryQuerySchema = z.object({
-  topic: z.string().min(1).max(80),
+  topic: z.string().min(1).max(320),
   since: z.string().min(1).max(64).optional(),
 });
 
 function toNotifyTopic(value: string): NotifyTopic | null {
   if (value === 'self' || value === 'user-alerts' || value === 'user-low') return value;
   if (!value.startsWith('agent:')) return null;
-  const agent = value.slice('agent:'.length);
+  // 与 Bearer 入口同口径：canonicalize（含 @ 才剥尾点）后再校验。
+  const agent = canonicalizeAgentAddress(value.slice('agent:'.length));
   return AGENT_NAME_RE.test(agent) ? `agent:${agent}` : null;
 }
 
@@ -295,6 +298,7 @@ function notifyHistoryError(c: Context, err: unknown) {
     );
   }
   if (err.code === 'unknown_agent') return c.json({ error: err.code }, 404);
+  if (err.code === 'invalid_agent_name') return c.json({ error: 'invalid_request' }, 400);
   return c.json({ error: err.code }, 502);
 }
 
@@ -317,7 +321,7 @@ function notificationLogError(c: Context, err: unknown) {
 }
 
 const notificationsQuerySchema = z.object({
-  channel: z.string().min(1).max(80).optional(),
+  channel: z.string().min(1).max(320).optional(),
   level: z.enum(['urgent', 'normal', 'low']).optional(),
   from: z.string().min(1).max(64).optional(),
   to: z.string().min(1).max(64).optional(),
@@ -336,38 +340,61 @@ const notifySummaryQuerySchema = z.object({
 });
 
 const notifyDiagnosticsQuerySchema = z.object({
-  channel: z.string().min(1).max(80).optional(),
+  channel: z.string().min(1).max(320).optional(),
 });
 
 function ownAgentChannel(c: Context): NotificationLogicalChannel | null {
   const auth = getAuth(c);
   if (auth.kind !== 'identity') return null;
-  const localpart = auth.address.split('@')[0];
-  return localpart && AGENT_NAME_RE.test(localpart) ? `agent:${localpart}` : null;
+  const address = canonicalizeAgentAddress(auth.address);
+  return address.includes('@') && AGENT_NAME_RE.test(address) ? `agent:${address}` : null;
 }
 
+type ScopedNotificationChannel = {
+  channel?: NotificationLogicalChannel;
+  /** 属主升级兼容：旧 localpart 频道，仅 identity 读侧合并。 */
+  aliases?: NotificationLogicalChannel[];
+  /** 别名行属主校验用 canonical 地址。 */
+  expectedOwner?: string;
+};
+
 /**
- * identity：强制自身 agent channel，越权 channel → 403。
- * admin：省略 = 全实例；给出的 channel 必须是合法逻辑频道。
+ * identity：强制自身 agent channel，越权 channel → 403；读侧可合并旧 localpart 别名。
+ * admin：省略 = 全实例；给出的 channel 必须是合法逻辑频道（精确，无别名）。
  */
 function scopeNotificationChannel(
   c: Context,
   requested: string | undefined,
-): NotificationLogicalChannel | undefined | Response {
+): ScopedNotificationChannel | Response {
   const auth = getAuth(c);
   if (auth.kind === 'identity') {
     const own = ownAgentChannel(c);
     if (!own) return c.json({ error: 'forbidden' }, 403);
-    if (requested && requested !== own && requested !== 'self') {
+    const full = canonicalizeAgentAddress(auth.address);
+    const localpart = full.split('@')[0];
+    const legacy =
+      localpart && AGENT_NAME_RE.test(localpart)
+        ? (`agent:${localpart}` as NotificationLogicalChannel)
+        : null;
+    if (
+      requested &&
+      requested !== own &&
+      requested !== 'self' &&
+      requested !== legacy
+    ) {
       return c.json({ error: 'forbidden: token is scoped to another notification channel' }, 403);
     }
-    return own;
+    return {
+      channel: own,
+      aliases: legacy && legacy !== own ? [legacy] : [],
+      expectedOwner: full,
+    };
   }
-  if (!requested) return undefined;
+  if (!requested) return { channel: undefined };
   if (!isLogicalChannel(requested)) {
     return c.json({ error: 'invalid_request: unknown channel' }, 400);
   }
-  return requested;
+  return { channel: requested };
 }
 
 /** 与 Bearer /v1/notify/verify 同一授权：admin 或 canNotifyUser。 */
@@ -648,18 +675,6 @@ export function createUiApiRoutes(
         201,
       );
     } catch (err) {
-      if (err instanceof LocalpartConflictError || (err as any).code === 'localpart_conflict') {
-        c.header('Cache-Control', 'no-store');
-        const domains = (err as any).domains ?? [];
-        return c.json(
-          {
-            error: 'localpart_conflict',
-            message: `localpart already exists on domain(s): ${domains.join(', ')}`,
-            domains,
-          },
-          409,
-        );
-      }
       if ((err as Error).message === 'invalid_localpart') {
         return c.json({ error: 'invalid_localpart' }, 400);
       }
@@ -905,6 +920,17 @@ export function createUiApiRoutes(
 
     const marked = await dependencies.setMessageSeen(address, id, parsed.data.seen);
     if (!marked) return c.json({ error: 'not_found' }, 404);
+    // 成功变更记 audit，并带 clientIp（对齐 identity.create 范例）
+    const auth = getAuth(c);
+    recordAuditEvent({
+      event: 'message.mark_seen',
+      address,
+      actor: auth.kind === 'admin' ? 'admin' : auth.address,
+      messageId: id,
+      seen: parsed.data.seen ? 'true' : 'false',
+      outcome: 'ok',
+      ip: clientIp(c),
+    });
     return c.json({ id, seen: parsed.data.seen });
   });
 
@@ -1146,8 +1172,8 @@ export function createUiApiRoutes(
     const auth = getAuth(c);
     let identityAddress: string | undefined;
     if (auth.kind === 'identity') {
-      const localpart = auth.address.split('@')[0];
-      const own = localpart ? (`agent:${localpart}` as NotifyTopic) : null;
+      const address = canonicalizeAgentAddress(auth.address);
+      const own = address.includes('@') ? (`agent:${address}` as NotifyTopic) : null;
       if (!own) return c.json({ error: 'forbidden' }, 403);
       // 授权边界：identity 不可用历史窥探 user 频道或其他 agent。
       if (topic === 'self') topic = own;
@@ -1189,7 +1215,9 @@ export function createUiApiRoutes(
 
     try {
       const page = await queryNotificationLog({
-        channel: scoped,
+        channel: scoped.channel,
+        channelAliases: scoped.aliases,
+        expectedOwner: scoped.expectedOwner,
         level: parsed.data.level,
         from: parsed.data.from,
         to: parsed.data.to,
@@ -1214,7 +1242,9 @@ export function createUiApiRoutes(
       const summary = await summarizeNotificationLog({
         date: parsed.data.date,
         tz: parsed.data.tz,
-        channel: scoped,
+        channel: scoped.channel,
+        channelAliases: scoped.aliases,
+        expectedOwner: scoped.expectedOwner,
       });
       return c.json(summary);
     } catch (err) {
@@ -1240,11 +1270,15 @@ export function createUiApiRoutes(
     const canVerify =
       auth.kind === 'admin' || Boolean(findIdentity(auth.address)?.canNotifyUser);
     try {
-      const last = await lastSuccessfulAt(scoped);
+      const last = await lastSuccessfulAt(
+        scoped.channel,
+        scoped.aliases,
+        scoped.expectedOwner,
+      );
       return c.json({
         enabled: config.ntfy.enabled,
         configured: Boolean(config.ntfy.enabled && config.ntfy.adminPassword),
-        channel: scoped ?? null,
+        channel: scoped.channel ?? null,
         lastSuccessfulAt: last,
         canVerify,
       });

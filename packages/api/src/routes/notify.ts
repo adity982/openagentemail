@@ -10,6 +10,7 @@ import {
   createNotificationDevice,
   listNotificationDevices,
   revokeNotificationDevice,
+  canonicalizeAgentAddress,
   type NotificationDevice,
   type NotifyLevel,
   type NotifyService,
@@ -28,7 +29,8 @@ import {
   releaseNotifyUserLimit,
 } from '../lib/ratelimit.ts';
 
-const AGENT_NAME_RE = /^[a-z0-9][a-z0-9._-]{0,62}$/;
+const AGENT_NAME_RE =
+  /^[a-z0-9][a-z0-9._-]{0,62}(?:@[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?(?:\.[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?)*)?$/;
 
 const notifySchema = z.object({
   target: z.union([
@@ -42,7 +44,7 @@ const notifySchema = z.object({
 }).strict();
 
 const historySchema = z.object({
-  topic: z.string().min(1).max(80),
+  topic: z.string().min(1).max(320),
   since: z.string().min(1).max(64).optional(),
 });
 
@@ -57,7 +59,8 @@ const deviceSchema = z.object({
 function toTopic(value: string): NotifyTopic | null {
   if (value === 'self' || value === 'user-alerts' || value === 'user-low') return value;
   if (!value.startsWith('agent:')) return null;
-  const agent = value.slice('agent:'.length);
+  // 与 Dashboard 入口同口径：canonicalize（含 @ 才剥尾点）后再校验。
+  const agent = canonicalizeAgentAddress(value.slice('agent:'.length));
   return AGENT_NAME_RE.test(agent) ? `agent:${agent}` : null;
 }
 
@@ -74,6 +77,7 @@ function notificationError(c: Context, err: unknown) {
     );
   }
   if (err.code === 'unknown_agent') return c.json({ error: err.code }, 404);
+  if (err.code === 'invalid_agent_name') return c.json({ error: 'invalid_request' }, 400);
   if (err.code === 'device_registry_unavailable') return c.json({ error: err.code }, 502);
   if (err.code === 'message_too_large') {
     // 413: payload exceeds the ntfy request budget after framing (F76).
@@ -92,8 +96,9 @@ function notificationError(c: Context, err: unknown) {
 function ownAgentTopic(c: Context): NotifyTopic | null {
   const auth = getAuth(c);
   if (auth.kind !== 'identity') return null;
-  const localpart = auth.address.split('@')[0];
-  return localpart ? `agent:${localpart}` : null;
+  // 自身频道键改为完整地址（去尾点），与 agents 新键口径一致。
+  const address = canonicalizeAgentAddress(auth.address);
+  return address.includes('@') ? `agent:${address}` : null;
 }
 
 /** Root-level user alerts require an explicit per-identity grant. */
@@ -212,9 +217,10 @@ export function createNotifyRoutes(options: NotifyRouteOptions = {}) {
       }
 
       try {
-        const agentLocalpart = addressed ? addressed.address.split('@')[0] : undefined;
+        // 发布目标与逻辑频道一律 agent:<full-address>（小写、去尾点）。
+        const agentKey = addressed ? canonicalizeAgentAddress(addressed.address) : undefined;
         const publishTarget: NotifyTarget =
-          input.target === 'user' ? 'user' : (`agent:${agentLocalpart}` as const);
+          input.target === 'user' ? 'user' : (`agent:${agentKey}` as const);
         return c.json(
           await service.publish({
             ...input,
@@ -225,7 +231,7 @@ export function createNotifyRoutes(options: NotifyRouteOptions = {}) {
                 ? input.level === 'low'
                   ? 'user-low'
                   : 'user-alerts'
-                : (`agent:${agentLocalpart}` as const),
+                : (`agent:${agentKey}` as const),
             sensitive: false,
             ...(addressed ? { identityAddress: addressed.address } : {}),
           }),

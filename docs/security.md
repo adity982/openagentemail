@@ -20,6 +20,10 @@ retention window before reusing one.
 <!-- Canonical copy lives in the website repo (src/content/docs/docs/); mirror
      this note there when publishing. -->
 
+## Multi-domain localparts and notification isolation (#134)
+
+Cross-domain reuse of the same localpart is allowed. Each identity's ntfy agent route is keyed by its full address so notifications do not cross domains; do not rely on bare localpart when more than one domain is configured.
+
 ## DATA_DIR 单写者约定
 
 `DATA_DIR` 下所有 store（`identities.json` / `oauth.json` / `audit.jsonl` / `ui-sessions.json`，以及 `sent-registry.json` / `notification-log.jsonl` / `notification-devices.json` / `send-log.jsonl`）均为**单写者**设计：进程内串行、tmp+rename、文件 0600 / 目录 0700。**不支持**多容器或多进程共享同一 `DATA_DIR`。
@@ -151,7 +155,7 @@ Catch-all 信箱里，身份之间的读边界是**精确整邮箱**匹配（禁
 
 ### 阻塞等待与预鉴权 IP 限量
 
-- `MCP_MAX_WAIT_SECONDS`（默认 60，可配 1..600）：只钳制 **REST** `POST /v1/messages/wait`（及 task wait）单段 `timeoutSec`，schema 仍广告 max 600，不 400。有效值见头 `X-OAE-Wait-Timeout-Sec` 与 408 体 `timeoutSec`（二者相等，且为实际等待的整数秒）。MCP `mail_wait_for` 另有调用方**总截止**，可再武装多段 REST；过早/畸形 408 在客户端 fail-fast，不用 backoff。
+- `MCP_MAX_WAIT_SECONDS`（默认 60，可配 1..600）：只钳制 **REST** `POST /v1/messages/wait`（及 task wait）单段 `timeoutSec`，schema 仍广告 max 600，不 400。有效值见头 `X-OAE-Wait-Timeout-Sec` 与 408 体 `timeoutSec`（二者相等，且为实际等待的整数秒）。MCP `mail_wait_for` 另有调用方**总截止**，可再武装多段 REST；过早/畸形 408 在客户端 fail-fast，不用 backoff。邮件族 wait 跳过 newest-20 内已读匹配（避免对已处理信即返空转）；task wait 路径不跳过 seen。
 - `OAUTH_RATE_PER_MIN`（默认 30）：`/authorize`、`/oauth/token`、`/oauth/revoke` 每 IP 每分钟。
 - `MCP_PREAUTH_RATE_PER_MIN`（默认 120）：`POST /mcp` 无/坏 token 的 401 挑战路径每 IP 每分钟。OAuth 引导握手故意无 token 探 401 拿挑战是规范动作；共享出口 IP 下默认须留余量。超限 `429` + `Retry-After`。
 - `GET /v1/messages` caller 列表限速（固定 60/60s，无独立 env）：按已鉴权地址（admin 共享命名空间桶）进程内单调流逝窗口。满图懒清理最多扫 10000 桶 × 每桶 60 戳。这是 per-caller 速率上界，**不是**全局 IMAP 并发保护；允许窗口内突发 60 次，多实例不共享。详见 docs/api.md。

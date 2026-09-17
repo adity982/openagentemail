@@ -197,10 +197,12 @@ export function createTaskRoutes(options: TaskRouteOptions = {}) {
         return c.json({ error: 'invalid_request: task participants must differ' }, 400);
       }
 
+      // create/wait 两段：未创建失败保持旧 502 无 id；已创建后 wait 失败必须带出 taskId。
+      let task: Task;
       try {
         const createApproval = service.createApproval;
         if (parsed.data.kind === 'approval' && !createApproval) throw new Error('approval_service_unavailable');
-        const task = parsed.data.kind === 'approval'
+        task = parsed.data.kind === 'approval'
           ? await createApproval!({
             from,
             to: parsed.data.to.toLowerCase(),
@@ -217,14 +219,8 @@ export function createTaskRoutes(options: TaskRouteOptions = {}) {
             body: parsed.data.body!,
             ...(parsed.data.parentTaskId !== undefined ? { parentTaskId: parsed.data.parentTaskId } : {}),
           });
-        const parent = await projectedParentTask(service, task.parentTaskId);
-        if (!parsed.data.wait) return c.json(taskViewFor(c, task, parent), 201);
-        // `wait` deliberately has one capped server turn. Long tasks are
-        // resumed by asking task_get or calling task_create(wait) again.
-        const waited = await waitWithSlot(c, service, task, from);
-        if (waited instanceof Response) return waited;
-        return c.json(taskViewFor(c, waited ?? task, parent), 201);
       } catch (err) {
+        // create 段：SMTP/校验失败 — 响应逐字节保持旧行为（502 smtp_error 无 id）。
         const code = (err as Error).message;
         if (code === 'invalid_approval_expiry' || code === 'invalid_parent_task_id') return c.json({ error: 'invalid_request' }, 400);
         if (code === 'parent_task_not_found') return c.json({ error: 'not_found' }, 404);
@@ -235,6 +231,36 @@ export function createTaskRoutes(options: TaskRouteOptions = {}) {
         }
         console.warn('[task] create failed:', code);
         return c.json({ error: 'smtp_error' }, 502);
+      }
+
+      // 已创建后：parent 投影 / 非 wait 201 / wait 均在同一 try——抛错不得落到 app 级 500 无 id。
+      try {
+        const parent = await projectedParentTask(service, task.parentTaskId);
+        if (!parsed.data.wait) return c.json(taskViewFor(c, task, parent), 201);
+        // `wait` deliberately has one capped server turn. Long tasks are
+        // resumed by asking task_get or calling task_create(wait) again.
+        const waited = await waitWithSlot(c, service, task, from);
+        if (waited instanceof Response) {
+          // 429：先 clone 再解析；失败返回未消费原 Response（保 429 语义与原响应头）。
+          if (waited.status === 429) {
+            try {
+              const b = await waited.clone().json() as Record<string, unknown>;
+              return c.json({ ...b, taskId: task.id }, 429);
+            } catch {
+              return waited;
+            }
+          }
+          return waited;
+        }
+        return c.json(taskViewFor(c, waited ?? task, parent), 201);
+      } catch (err) {
+        // 复用 journalUnavailable 判定（lease_journal_* → 503），body 补身份字段。
+        const mapped = journalUnavailable(c, err);
+        if (mapped) {
+          return c.json({ error: (err as Error).message, taskId: task.id, created: true }, 503);
+        }
+        console.warn('[task] create post-create/wait failed:', (err as Error).message);
+        return c.json({ error: 'smtp_error', taskId: task.id, created: true }, 502);
       }
     })
     .get('/', async (c) => {

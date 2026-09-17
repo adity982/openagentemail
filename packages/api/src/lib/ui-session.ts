@@ -34,6 +34,8 @@ export const DENIED_AUDIT_THROTTLE_MS = 60 * 1000;
 const MINT_DENIED_AUDIT_THROTTLE_MS = DENIED_AUDIT_THROTTLE_MS;
 /** Connect 明文 token 下发审计节流窗口（与 denied 审计同为 60s）。 */
 export const CONNECT_REVEAL_AUDIT_THROTTLE_MS = DENIED_AUDIT_THROTTLE_MS;
+/** 测试可见：Connect reveal 节流表与 mint/session denied 共用上限。 */
+export const CONNECT_REVEAL_AUDIT_MAX_TRACKED = MAX_TRACKED_IPS;
 /** authenticate 更新 lastSeenAt 的落盘节流：默认 5 分钟内不重复写盘。 */
 export const LAST_SEEN_PERSIST_INTERVAL_MS = 5 * 60 * 1000;
 /** ?token= 换取的一次性交换码默认 TTL：硬约束 ≤10 分钟。 */
@@ -545,12 +547,25 @@ export class UiSessionStore {
 
   /**
    * Connect 明文 token 下发审计节流：每会话+IP 每分钟至多认领 1 次。
+   * 认领前顺手清过期；插入新键时若已满则剪最旧（读路径自封顶，不依赖 cleanup）。
    * @returns true 时调用方应落 identity.token.reveal
    */
   claimConnectRevealAudit(sid: string, ip: string, now = Date.now()): boolean {
+    for (const [trackedKey, trackedAt] of this.lastConnectRevealAuditAt) {
+      if (now - trackedAt > CONNECT_REVEAL_AUDIT_THROTTLE_MS) {
+        this.lastConnectRevealAuditAt.delete(trackedKey);
+      }
+    }
     const key = `${sid}:${ip}`;
     const lastAt = this.lastConnectRevealAuditAt.get(key) ?? 0;
     if (now - lastAt < CONNECT_REVEAL_AUDIT_THROTTLE_MS) return false;
+    if (!this.lastConnectRevealAuditAt.has(key)) {
+      while (this.lastConnectRevealAuditAt.size >= MAX_TRACKED_IPS) {
+        const oldest = this.lastConnectRevealAuditAt.keys().next().value;
+        if (oldest === undefined) break;
+        this.lastConnectRevealAuditAt.delete(oldest);
+      }
+    }
     this.lastConnectRevealAuditAt.set(key, now);
     return true;
   }

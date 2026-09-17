@@ -18,6 +18,7 @@ const {
   UiSessionStore,
   COOKIE_NAME,
   CONNECT_REVEAL_AUDIT_THROTTLE_MS,
+  CONNECT_REVEAL_AUDIT_MAX_TRACKED,
 } = await import('../src/lib/ui-session.ts');
 const { createUiApiRoutes } = await import('../src/routes/ui.ts');
 const { readAuditEvents, resetAuditForTests } = await import('../src/lib/audit.ts');
@@ -270,5 +271,21 @@ describe('Connect reveal audit throttle map (R2, UiSessionStore cleanup)', () =>
         t0 + CONNECT_REVEAL_AUDIT_THROTTLE_MS,
       ),
     ).toBe(true);
+  });
+
+  test('R3: claimConnectRevealAudit caps at MAX_TRACKED without cleanup()', () => {
+    const store = new UiSessionStore({ resolveToken: resolver });
+    const t0 = 9_000_000;
+    const max = CONNECT_REVEAL_AUDIT_MAX_TRACKED;
+    for (let i = 0; i < max; i += 1) {
+      expect(store.claimConnectRevealAudit(`sid-${i}`, '127.0.0.1', t0 + i)).toBe(true);
+    }
+    expect(store.connectRevealAuditSizeForTests()).toBe(max);
+    // 读路径再认领新键：剪最旧，仍 ≤1000，且不经 cleanup()
+    expect(store.claimConnectRevealAudit('sid-new', '127.0.0.1', t0 + max)).toBe(true);
+    expect(store.connectRevealAuditSizeForTests()).toBe(max);
+    // 被剪掉的最旧键可再次认领
+    expect(store.claimConnectRevealAudit('sid-0', '127.0.0.1', t0 + max + 1)).toBe(true);
+    expect(store.connectRevealAuditSizeForTests()).toBe(max);
   });
 });

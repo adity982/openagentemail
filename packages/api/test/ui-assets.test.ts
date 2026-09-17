@@ -268,6 +268,14 @@ describe('UI static asset contract', () => {
     expect(CONNECT_PAGE_JS).toContain(
       'if (!connectCredentialValue || !connectRevealed) return;',
     );
+    // R3 i案：Copy instruction 只复制 prompt，不含 config/token 拼接
+    expect(CONNECT_PAGE_JS).toContain("'Copy instruction'");
+    expect(CONNECT_PAGE_JS).not.toContain(
+      "definition.prompt + '\\n\\n' + definition.config",
+    );
+    expect(CONNECT_PAGE_JS).toContain('definition.prompt,');
+    expect(CONNECT_PAGE_JS).toContain('with Copy setup');
+    expect(CONNECT_PAGE_JS).toContain('Do not ask me to paste a token');
     // R2：logout/离页代际作废，迟到响应不得复活明文
     expect(CONNECT_PAGE_JS).toContain('var connectLoadGen = 0');
     expect(CONNECT_PAGE_JS).toContain('connectLoadGen += 1');

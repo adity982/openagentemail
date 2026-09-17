@@ -20,8 +20,9 @@ function connectAgentDefinitions(endpoint, token) {
       name: 'Kimi Code',
       location: '~/.kimi-code/mcp.json',
       config: jsonConfig(jsonServer),
+      // i案：instruction 不含 config/token；指引先 Copy setup 落盘，再令 agent 读本地配置自验
       prompt:
-        'Add an HTTP MCP server named openagent-email to ~/.kimi-code/mcp.json using this exact configuration. Do not print or commit the token. Then start a new Kimi Code session and verify the server with /mcp.',
+        'I already saved openagent-email into ~/.kimi-code/mcp.json with Copy setup. Do not ask me to paste a token. Read that local file, keep the bearer private (never print or commit it), start a new Kimi Code session, and verify the server with /mcp.',
     },
     {
       name: 'Codex',
@@ -33,7 +34,7 @@ function connectAgentDefinitions(endpoint, token) {
         JSON.stringify(authorization) +
         ' }',
       prompt:
-        'Add the following openagent_email Streamable HTTP MCP server to ~/.codex/config.toml. Preserve my existing settings, never print or commit the token, and verify it with codex mcp get openagent_email.',
+        'I already added openagent_email to ~/.codex/config.toml with Copy setup. Do not ask me to paste a token. Read that local config, preserve my other settings, never print or commit the bearer, and verify with codex mcp get openagent_email.',
     },
     {
       name: 'Claude Code',
@@ -44,14 +45,14 @@ function connectAgentDefinitions(endpoint, token) {
         ' openagent-email ' +
         shellSingleQuote(endpoint),
       prompt:
-        'Run the following command to add my OpenAgent.email server to Claude Code at user scope. Do not echo, log, or commit the token. Then run claude mcp get openagent-email to verify it.',
+        'I already ran the Copy setup command to register openagent-email in Claude Code at user scope. Do not ask me to paste a token. Confirm the local MCP entry, never echo or commit the bearer, then run claude mcp get openagent-email to verify it.',
     },
     {
       name: 'Cursor',
       location: '~/.cursor/mcp.json',
       config: jsonConfig(jsonServer),
       prompt:
-        'Merge this server into ~/.cursor/mcp.json without removing existing servers. Keep the bearer token private, then open Cursor MCP settings and confirm openagent-email connects.',
+        'I already merged openagent-email into ~/.cursor/mcp.json with Copy setup. Do not ask me to paste a token. Read that local file without removing other servers, keep the bearer private, then open Cursor MCP settings and confirm openagent-email connects.',
     },
     {
       name: 'ZCode',
@@ -72,7 +73,7 @@ function connectAgentDefinitions(endpoint, token) {
         2,
       ),
       prompt:
-        'Merge this HTTP server into mcp.servers in ~/.zcode/cli/config.json without changing my other settings. Keep the token private, restart the agent session, and verify openagent-email in Settings > MCP Servers.',
+        'I already merged openagent-email into mcp.servers in ~/.zcode/cli/config.json with Copy setup. Do not ask me to paste a token. Read that local config without changing my other settings, keep the bearer private, restart the agent session, and verify openagent-email in Settings > MCP Servers.',
     },
     {
       name: 'ChatGPT',
@@ -148,7 +149,8 @@ function renderConnectCards() {
     prompt.textContent = definition.prompt;
     var promptCopy = connectCopyButton(
       'Copy instruction',
-      definition.prompt + '\n\n' + definition.config,
+      // i案：只复制 prompt 文案，绝不附带 config/token
+      definition.prompt,
       prompt,
       !definition.manual,
     );

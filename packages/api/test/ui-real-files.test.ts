@@ -120,11 +120,12 @@ describe('UI real-file manifest (#520-A)', () => {
         .update(Buffer.from(s, 'utf8'))
         .digest('hex');
     // #134、#196/R3 与 #231 Connect 页面均为有意 UI 变更；更新前已确认差异有意。
+    // #231 续作：Copy token 纳入 reveal 门控后更新 UI_JS；CSS 针脚对齐合并 main 后实字节。
     expect(sha256(UI_JS)).toBe(
-      'cb42dfe00e5052383ce21749dddc517b2f496eaacfc731f6fb5a14be47bace65',
+      'cf8c88eb75c76688d9521274d9a12fca1081789cb4568b4bc0665b9c17f70e8f',
     );
     expect(sha256(UI_CSS)).toBe(
-      '696f10717a3b159518dcc9bd1fbe6ac801c3891ff12066b605e1e6f8b97add3b',
+      'bccfd50b1660b04dde56701ad2c5d1aae7d0900de4990c0d75a03318f2d06043',
     );
   });
 });

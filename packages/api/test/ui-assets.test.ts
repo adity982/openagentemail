@@ -263,6 +263,11 @@ describe('UI static asset contract', () => {
     expect(CONNECT_PAGE_JS).toContain("payload.unavailable === 'identity_session_required'");
     expect(CONNECT_PAGE_JS).toContain("payload.unavailable === 'token_unavailable'");
     expect(CONNECT_PAGE_JS).toContain("button.disabled = Boolean(sensitive && !connectRevealed)");
+    // nit：主 Copy token 钮纳入 reveal 门控（遮蔽态 disabled + 点击守卫）
+    expect(CONNECT_PAGE_JS).toContain('connectTokenCopy.disabled = !connectRevealed');
+    expect(CONNECT_PAGE_JS).toContain(
+      'if (!connectCredentialValue || !connectRevealed) return;',
+    );
     expect(CONNECT_PAGE_JS).toContain("split(connectCredentialValue).join('<identity-token>')");
     expect(CONNECT_PAGE_JS).not.toMatch(/console\s*\./);
     expect(CONNECT_PAGE_JS).not.toMatch(/localStorage|sessionStorage|indexedDB/);

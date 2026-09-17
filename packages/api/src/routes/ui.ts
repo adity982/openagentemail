@@ -568,6 +568,24 @@ export function isValidMessageUid(id: string): boolean {
   return Number.isSafeInteger(uid) && uid <= 4_294_967_295;
 }
 
+/** Connect 明文 token 下发审计节流窗口：按会话/IP 每分钟至多 1 条，防写放大。 */
+const CONNECT_REVEAL_AUDIT_THROTTLE_MS = 60 * 1000;
+const lastConnectRevealAuditAt = new Map<string, number>();
+
+/** 测试辅助：清空 Connect reveal 审计节流时钟。 */
+export function resetConnectRevealAuditThrottleForTests(): void {
+  lastConnectRevealAuditAt.clear();
+}
+
+/**
+ * GET /ui/api/connect 防御深度：仅放行 Sec-Fetch-Site=same-origin|none。
+ * SFS 为 forbidden header，页面 JS 不可伪造；缺席与 cross-site 一律 403。
+ */
+function connectSecFetchSiteAllowed(c: Context): boolean {
+  const site = (c.req.header('sec-fetch-site') ?? '').toLowerCase();
+  return site === 'same-origin' || site === 'none';
+}
+
 export function createUiApiRoutes(
   store: UiSessionStore,
   dependencies: UiApiDependencies = defaultDependencies,
@@ -586,6 +604,10 @@ export function createUiApiRoutes(
   });
 
   routes.get('/connect', (c) => {
+    // P2-2：凭据下发 GET 追加 SFS 闸，不依赖未来 CORS/SameSite 变更仍能兜底
+    if (!connectSecFetchSiteAllowed(c)) {
+      return c.json({ error: 'forbidden' }, 403);
+    }
     const auth = getAuth(c);
     const endpoint = resolveResourceUri(new URL(c.req.url).origin, options.publicBaseUrl);
     if (auth.kind !== 'identity') {
@@ -597,7 +619,24 @@ export function createUiApiRoutes(
       });
     }
 
-    const token = store.identityTokenForSession(c.get('uiSessionSid'), auth.address);
+    const sid = c.get('uiSessionSid');
+    const token = store.identityTokenForSession(sid, auth.address);
+    // P2-1：明文 token 非空返回才落 identity.token.reveal；按会话+IP 节流
+    if (token) {
+      const ip = clientIp(c);
+      const throttleKey = `${sid}:${ip}`;
+      const now = Date.now();
+      const lastAt = lastConnectRevealAuditAt.get(throttleKey) ?? 0;
+      if (now - lastAt >= CONNECT_REVEAL_AUDIT_THROTTLE_MS) {
+        lastConnectRevealAuditAt.set(throttleKey, now);
+        recordAuditEvent({
+          event: 'identity.token.reveal',
+          address: auth.address,
+          outcome: 'ok',
+          ip,
+        });
+      }
+    }
     return c.json({
       endpoint,
       identity: auth.address,

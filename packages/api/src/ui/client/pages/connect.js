@@ -193,7 +193,10 @@ async function loadConnectPage() {
     }
     connectCredentialValue = payload.token;
     connectCredential.hidden = false;
-    connectTokenCopy.disabled = false;
+    // nit：主「Copy token」钮与五卡 copy 同逻辑——遮蔽态保持 disabled
+    connectTokenCopy.disabled = true;
+    connectTokenCopy.title =
+      'Reveal the identity token before copying this value.';
     connectState.textContent =
       'Reveal the token to enable ready-to-copy setup for each agent.';
     renderConnectCards();
@@ -223,6 +226,14 @@ connectTokenReveal.addEventListener('click', function () {
     : '••••••••••••';
   connectTokenReveal.textContent = connectRevealed ? 'Hide' : 'Reveal';
   connectTokenReveal.setAttribute('aria-pressed', String(connectRevealed));
+  // 与 connectCopyButton 对齐：仅 reveal 后允许复制明文 token
+  connectTokenCopy.disabled = !connectRevealed;
+  if (connectTokenCopy.disabled) {
+    connectTokenCopy.title =
+      'Reveal the identity token before copying this value.';
+  } else {
+    connectTokenCopy.removeAttribute('title');
+  }
   renderConnectCards();
   announce(
     connectRevealed ? 'Identity token revealed.' : 'Identity token hidden.',
@@ -230,6 +241,7 @@ connectTokenReveal.addEventListener('click', function () {
 });
 
 connectTokenCopy.addEventListener('click', function () {
-  if (!connectCredentialValue) return;
+  // 双保险：遮蔽态即使被强制启用也不交出真值
+  if (!connectCredentialValue || !connectRevealed) return;
   copyValue(connectCredentialValue, connectToken, connectTokenCopy);
 });

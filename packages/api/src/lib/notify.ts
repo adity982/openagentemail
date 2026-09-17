@@ -11,6 +11,7 @@
 import { createHash, randomBytes } from 'node:crypto';
 import { chmodSync, existsSync, mkdirSync, readFileSync, renameSync, writeFileSync } from 'node:fs';
 import { dirname, join } from 'node:path';
+import { recordAuditEvent } from './audit.ts';
 import { config } from './config.ts';
 import { findIdentity, listIdentities, type Identity } from './identities.ts';
 import {
@@ -31,6 +32,7 @@ import {
   reconcilePendingRevokes,
   registerPairedDevice,
   revokePairedDevice,
+  type DeleteNtfyUser,
   type DeviceListItem,
   type NtfyUserDeleteResult,
 } from './notification-devices.ts';
@@ -181,6 +183,14 @@ type Route = {
   ownerAddress?: string;
 };
 
+/** agent reader 吊销对账行：复用 phone 设备线 deleted/not_found/transient 分类。 */
+type PendingReaderRevoke = {
+  username: string;
+  address: string;
+  status: 'pending_revoke';
+  createdAt: string;
+};
+
 type NotifyState = {
   version: 1;
   suffix: string;
@@ -188,6 +198,8 @@ type NotifyState = {
   userAlerts: Route;
   userLow: Route;
   agents: Record<string, Route>;
+  /** 可选：身份删除/boot 清幽灵后待对账的 reader 用户名队列。 */
+  pendingReaderRevokes?: PendingReaderRevoke[];
 };
 
 const TOKEN_ALPHABET = 'abcdefghijklmnopqrstuvwxyz0123456789';
@@ -274,6 +286,24 @@ export async function commitNotificationState(
   save();
 }
 
+/**
+ * deleteIdentity 同步级联用的落盘钩子：先请求 writeConfig，再 save JSON。
+ * 默认 writeConfig 异步踢 server.yml 重写（不阻塞同步签名）；save 失败即抛。
+ */
+type SyncCascadeCommitFn = (writeConfig: () => void, save: () => void) => void;
+
+const defaultSyncCascadeCommit: SyncCascadeCommitFn = (writeConfig, save) => {
+  writeConfig();
+  save();
+};
+
+let syncCascadeCommitImpl: SyncCascadeCommitFn = defaultSyncCascadeCommit;
+
+/** @internal 测试缝：注入同步级联落盘（state 持久化失败 fail-closed）。 */
+export function setSyncCascadeCommitForTests(fn: SyncCascadeCommitFn | null): void {
+  syncCascadeCommitImpl = fn ?? defaultSyncCascadeCommit;
+}
+
 function isUsableAgentRoute(entry: Route | undefined): entry is Route {
   return !!entry && NTFY_TOPIC_RE.test(entry.topic) && /^[a-z0-9_-]{1,64}$/.test(entry.reader.username);
 }
@@ -304,9 +334,24 @@ function isRoute(value: unknown): value is Route {
   return true;
 }
 
+function isPendingReaderRevoke(value: unknown): value is PendingReaderRevoke {
+  if (!value || typeof value !== 'object') return false;
+  const row = value as Record<string, unknown>;
+  return (
+    typeof row.username === 'string' &&
+    typeof row.address === 'string' &&
+    row.status === 'pending_revoke' &&
+    typeof row.createdAt === 'string'
+  );
+}
+
 function isState(value: unknown): value is NotifyState {
   if (!value || typeof value !== 'object') return false;
   const state = value as Record<string, unknown>;
+  if (state.pendingReaderRevokes !== undefined) {
+    if (!Array.isArray(state.pendingReaderRevokes)) return false;
+    if (!state.pendingReaderRevokes.every(isPendingReaderRevoke)) return false;
+  }
   return (
     state.version === 1 &&
     typeof state.suffix === 'string' &&
@@ -403,10 +448,56 @@ export function setNotifyPasswordHashForTests(fn: ((password: string) => Promise
   passwordHashForTests = fn;
 }
 
-async function writeServerConfig(state: NotifyState): Promise<void> {
-  const adminPassword = config.ntfy.adminPassword;
-  if (!adminPassword) throw new NotifyError('notifications_unconfigured');
+/**
+ * 模块级串行化 + coalesce：挂起期间再调只更新 latest 引用并返回同一 promise；
+ * 开写时再拍 agents 快照。连续 N 次删除合并为尽量少的全量 bcrypt 重写。
+ * adminPassword 在入队时快照：避免测试 finally / 配置热切把 in-flight 重写打成 unconfigured。
+ */
+type WriteServerConfigRequest = { state: NotifyState; adminPassword: string };
 
+let writeServerConfigChain: Promise<void> = Promise.resolve();
+let writeServerConfigLatest: WriteServerConfigRequest | null = null;
+let writeServerConfigCoalesce: Promise<void> | null = null;
+
+/** @internal 测试缝：每次实际开写时回调当前 agents 键（排队后、await 哈希前）。 */
+let writeServerConfigObserverForTests: ((agentKeys: string[]) => void) | null = null;
+
+export function setWriteServerConfigObserverForTests(
+  fn: ((agentKeys: string[]) => void) | null,
+): void {
+  writeServerConfigObserverForTests = fn;
+}
+
+/** @internal 测试缝：等待 writeServerConfig 队列排空（含 coalesce drain）。 */
+export async function flushWriteServerConfigForTests(): Promise<void> {
+  // 吞掉 drain 拒绝：flush 只保证排空，不把 best-effort 失败抬成用例失败。
+  await writeServerConfigChain.then(
+    () => undefined,
+    () => undefined,
+  );
+  while (writeServerConfigCoalesce) {
+    await writeServerConfigCoalesce.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+  await writeServerConfigChain.then(
+    () => undefined,
+    () => undefined,
+  );
+}
+
+/** @internal 测试缝：coalesce 队列是否空闲（无 in-flight / 无挂起 latest）。 */
+export function isWriteServerConfigIdleForTests(): boolean {
+  return writeServerConfigCoalesce === null && writeServerConfigLatest === null;
+}
+
+async function writeServerConfigBody(
+  state: NotifyState,
+  adminPassword: string,
+): Promise<void> {
+  // agents 快照在拿到槽位、真正开写时拍；密码用入队快照。
+  writeServerConfigObserverForTests?.(Object.keys(state.agents).sort());
   const readers = [state.userAlerts, state.userLow, ...Object.values(state.agents)];
   const adminHash = await passwordHash(adminPassword);
   const publisherHash = await passwordHash(randomBytes(24).toString('base64url'));
@@ -443,6 +534,54 @@ async function writeServerConfig(state: NotifyState): Promise<void> {
   writePrivate(config.ntfy.configPath, lines.join('\n'));
 }
 
+/** 入队重写；挂起中只更新 latest（含密码快照）并返回同一 drain。 */
+async function enqueueWriteServerConfig(req: WriteServerConfigRequest): Promise<void> {
+  writeServerConfigLatest = req;
+  if (writeServerConfigCoalesce) return writeServerConfigCoalesce;
+
+  const drain = (async () => {
+    await writeServerConfigChain.then(
+      () => undefined,
+      () => undefined,
+    );
+    while (writeServerConfigLatest) {
+      const toWrite = writeServerConfigLatest;
+      writeServerConfigLatest = null;
+      await writeServerConfigBody(toWrite.state, toWrite.adminPassword);
+    }
+  })();
+
+  writeServerConfigCoalesce = drain;
+  writeServerConfigChain = drain.then(
+    () => undefined,
+    () => undefined,
+  );
+  // finally 派生 Promise 在 drain 拒绝时继承拒绝态；必须 .catch，否则 void 即 unhandledrejection。
+  // await 方仍从返回的 drain 上感知拒绝；此处只吞掉 cleanup 链。
+  void drain
+    .finally(() => {
+      if (writeServerConfigCoalesce === drain) {
+        writeServerConfigCoalesce = null;
+        // finally 窗口内若又有新请求，用已快照的 latest 补开一轮
+        if (writeServerConfigLatest) {
+          void enqueueWriteServerConfig(writeServerConfigLatest).catch((err) => {
+            console.warn('[notify] writeServerConfig coalesce follow-up failed', {
+              error: err instanceof Error ? err.message : 'unknown',
+            });
+          });
+        }
+      }
+    })
+    .catch(() => undefined);
+  return drain;
+}
+
+async function writeServerConfig(state: NotifyState): Promise<void> {
+  const adminPassword = config.ntfy.adminPassword;
+  if (!adminPassword) throw new NotifyError('notifications_unconfigured');
+  return enqueueWriteServerConfig({ state, adminPassword });
+}
+
 let cachedState: NotifyState | undefined;
 
 /** @internal Test seam for exercising notification-store load and recovery. */
@@ -467,6 +606,279 @@ export function getNotificationAgentRouteForTests(agent: string): Route | undefi
 export function runLegacyOwnerStampForTests(): void {
   if (!cachedState) cachedState = loadState();
   stampLegacyAgentOwners(cachedState);
+}
+
+/** @internal 测试缝：读取 pending reader 吊销队列。 */
+export function getPendingReaderRevokesForTests(): PendingReaderRevoke[] {
+  if (!cachedState) cachedState = loadState();
+  return [...(cachedState.pendingReaderRevokes ?? [])];
+}
+
+function enqueuePendingReaderRevoke(
+  state: NotifyState,
+  username: string,
+  address: string,
+): void {
+  if (!username) return;
+  const list = state.pendingReaderRevokes ?? (state.pendingReaderRevokes = []);
+  if (list.some((row) => row.username === username && row.status === 'pending_revoke')) return;
+  list.push({
+    username,
+    address,
+    status: 'pending_revoke',
+    createdAt: new Date().toISOString(),
+  });
+}
+
+/**
+ * deleteIdentity 同步级联：删完整地址 agents 键并持久化（请求 writeConfig），
+ * reader 落 pending_revoke；裸 localpart 键不碰。state 持久化失败抛错 fail-closed。
+ */
+export function removeAgentRouteOnIdentityDelete(
+  address: string,
+  actor = 'deleteIdentity',
+): void {
+  // 未启用 ntfy：无活凭据可外泄，跳过清理且不物化 notifications.json。
+  if (!config.ntfy.enabled) return;
+
+  const agent = canonicalizeAgentAddress(address);
+  // 只碰完整地址键；裸 localpart 一行不动（R2-4 跨域复用防线）。
+  if (!agent.includes('@')) return;
+
+  if (!cachedState) cachedState = loadState();
+  const current = cachedState;
+  const entry = current.agents[agent];
+  if (!entry) return;
+
+  const previous = entry;
+  const previousPending = current.pendingReaderRevokes
+    ? current.pendingReaderRevokes.map((row) => ({ ...row }))
+    : undefined;
+  delete current.agents[agent];
+  enqueuePendingReaderRevoke(current, previous.reader.username, agent);
+
+  try {
+    // 先落 JSON（fail-closed 边界）；成功后再踢 server.yml，避免回滚与异步重写竞态。
+    syncCascadeCommitImpl(
+      () => {
+        /* writeConfig 延后到 save 成功之后 */
+      },
+      () => saveState(current),
+    );
+  } catch (err) {
+    current.agents[agent] = previous;
+    if (previousPending) current.pendingReaderRevokes = previousPending;
+    else delete current.pendingReaderRevokes;
+    throw err;
+  }
+
+  // 持久化成功后立即 best-effort 首次吊销（保持同步签名不阻塞）。
+  // 失败行留 pending，由既有 reconcile/boot 对账收敛——无 boot/无设备列表时也能踢出旧 reader。
+  void reconcilePendingReaderRevokes().catch((err) => {
+    console.warn('[notify] first reader revoke after identity delete failed', {
+      address: agent,
+      error: err instanceof Error ? err.message : 'unknown',
+    });
+  });
+
+  if (config.ntfy.adminPassword) {
+    void writeServerConfig(current).catch((err) => {
+      console.warn('[notify] server.yml rewrite after agent route delete failed', {
+        address: agent,
+        error: err instanceof Error ? err.message : 'unknown',
+      });
+    });
+  }
+
+  recordAuditEvent({
+    event: 'identity.notify_route.delete',
+    outcome: 'ok',
+    address: agent,
+    actor,
+  });
+}
+
+/**
+ * 单轮 reader 吊销对账时间预算（ms）；与 NTFY_ADMIN_FETCH_TIMEOUT_MS 同口径常量。
+ */
+export const READER_REVOKE_RECONCILE_BUDGET_MS = 5_000;
+/** 单轮最多新开 DELETE 的 pending 行数。 */
+export const READER_REVOKE_RECONCILE_MAX_ROWS = 32;
+
+let readerRevokeReconcileBudgetMsForTests: number | null = null;
+let readerRevokeReconcileMaxRowsForTests: number | null = null;
+
+/** @internal 测试缝：注入对账时间预算（null 恢复默认）。 */
+export function setReaderRevokeReconcileBudgetForTests(ms: number | null): void {
+  readerRevokeReconcileBudgetMsForTests = ms;
+}
+
+/** @internal 测试缝：注入单轮最大开行数（null 恢复默认）。 */
+export function setReaderRevokeReconcileMaxRowsForTests(n: number | null): void {
+  readerRevokeReconcileMaxRowsForTests = n;
+}
+
+function readerRevokeReconcileBudgetMs(): number {
+  const raw = readerRevokeReconcileBudgetMsForTests ?? READER_REVOKE_RECONCILE_BUDGET_MS;
+  // clamp 风格：有限正整数，至少 1ms
+  if (!Number.isFinite(raw)) return READER_REVOKE_RECONCILE_BUDGET_MS;
+  return Math.min(Math.max(1, Math.trunc(raw)), 60_000);
+}
+
+function readerRevokeReconcileMaxRows(): number {
+  const raw = readerRevokeReconcileMaxRowsForTests ?? READER_REVOKE_RECONCILE_MAX_ROWS;
+  if (!Number.isFinite(raw)) return READER_REVOKE_RECONCILE_MAX_ROWS;
+  return Math.min(Math.max(1, Math.trunc(raw)), 1_000);
+}
+
+let readerRevokeReconcileInFlight: Promise<void> | null = null;
+let readerRevokeReconcileAgain = false;
+
+/** @internal 测试缝：等待 reader revoke 对账 in-flight 排空（含 again 重跑）。 */
+export async function whenReaderRevokeReconcileIdleForTests(): Promise<void> {
+  for (;;) {
+    const p = readerRevokeReconcileInFlight;
+    if (!p) return;
+    await p.then(
+      () => undefined,
+      () => undefined,
+    );
+  }
+}
+
+/** @internal 测试缝：每轮 run() 开头回调（用于断言合并后轮数）。 */
+let onReaderRevokeReconcileRunForTests: (() => void) | null = null;
+
+export function setOnReaderRevokeReconcileRunForTests(fn: (() => void) | null): void {
+  onReaderRevokeReconcileRunForTests = fn;
+}
+
+/**
+ * 对账 pending reader 吊销：复用 deleteNtfyUserResult 三分类。
+ * deleted/not_found → 出队收敛；transient → 留 pending 下轮重试。
+ * 结尾差集合并：只滤掉本轮已确认 username，迭代间隙新入队行保留（排在 head）。
+ * 轮换公平：本轮 attemptedTransient 行按相对顺序移到队尾，避免队首持续 transient 饿死后续行。
+ * in-flight 合并：并发触发共享同一 promise；again 保证至少再跑一轮（间隙入队必处理）；
+ * 调用方等待有界（当前轮 + again 重跑至安静），避免 N 次删除串成 N×预算堵住设备对账。
+ * 整体预算（时间+行数双闸）：耗尽即停开新行；confirmed 或 rotation 任一非空即落盘。
+ */
+export async function reconcilePendingReaderRevokes(
+  deleteUser: DeleteNtfyUser = deleteNtfyUserResult,
+): Promise<void> {
+  if (readerRevokeReconcileInFlight) {
+    readerRevokeReconcileAgain = true;
+    return readerRevokeReconcileInFlight;
+  }
+
+  const run = async (): Promise<void> => {
+    onReaderRevokeReconcileRunForTests?.();
+    if (!cachedState) cachedState = loadState();
+    const current = cachedState;
+    const snapshot = [...(current.pendingReaderRevokes ?? [])];
+    if (!snapshot.length) return;
+
+    const deadline = Date.now() + readerRevokeReconcileBudgetMs();
+    const maxRows = readerRevokeReconcileMaxRows();
+    let started = 0;
+    const confirmed = new Set<string>();
+    // 本轮已尝试且仍 transient 的行：落盘时移到队尾，让未开行下次优先。
+    const attemptedTransient = new Set<string>();
+    for (const row of snapshot) {
+      if (row.status !== 'pending_revoke') continue;
+      // 预算耗尽：停开新行；未处理与已见 transient 留队下轮。
+      if (started >= maxRows || Date.now() >= deadline) break;
+      started += 1;
+      const result = await deleteUser(row.username);
+      if (result === 'transient') {
+        attemptedTransient.add(row.username);
+        continue;
+      }
+      // deleted | not_found：本轮确认收敛。
+      confirmed.add(row.username);
+    }
+    // 无收敛且无轮换则无需落盘。
+    if (confirmed.size === 0 && attemptedTransient.size === 0) return;
+
+    // 重读当前队列（可能含迭代间隙新入队），去掉 confirmed；
+    // 未尝试/新入队 → head；本轮 transient → tail（保相对顺序）。
+    const latest = current.pendingReaderRevokes ?? [];
+    const remaining = latest.filter((row) => !confirmed.has(row.username));
+    const head: PendingReaderRevoke[] = [];
+    const tail: PendingReaderRevoke[] = [];
+    for (const row of remaining) {
+      if (attemptedTransient.has(row.username)) tail.push(row);
+      else head.push(row);
+    }
+    const merged = [...head, ...tail];
+    current.pendingReaderRevokes = merged.length > 0 ? merged : undefined;
+    saveState(current);
+  };
+
+  const p = (async () => {
+    try {
+      do {
+        readerRevokeReconcileAgain = false;
+        await run();
+      } while (readerRevokeReconcileAgain);
+    } finally {
+      readerRevokeReconcileInFlight = null;
+    }
+  })();
+  readerRevokeReconcileInFlight = p;
+  return p;
+}
+
+/**
+ * boot reconcile：清「完整地址键但对应身份不存在」的存量幽灵。
+ * 裸 localpart 键一律保留；有身份主键不动。
+ * 对齐 delete 路径：先 save 再 audit；save 失败回滚内存且不发 audit。
+ */
+export function purgeOrphanFullAddressAgentRoutes(actor = 'boot_reconcile'): boolean {
+  if (!cachedState) cachedState = loadState();
+  const current = cachedState;
+
+  const toPurge: Array<{ key: string; entry: Route }> = [];
+  for (const key of Object.keys(current.agents)) {
+    if (!key.includes('@')) continue;
+    if (findIdentity(key)) continue;
+    toPurge.push({ key, entry: current.agents[key]! });
+  }
+  if (toPurge.length === 0) return false;
+
+  const previousPending = current.pendingReaderRevokes
+    ? current.pendingReaderRevokes.map((row) => ({ ...row }))
+    : undefined;
+
+  for (const { key, entry } of toPurge) {
+    delete current.agents[key];
+    enqueuePendingReaderRevoke(current, entry.reader.username, key);
+  }
+
+  try {
+    syncCascadeCommitImpl(
+      () => {
+        /* boot purge 只落 JSON；server.yml 由 initializeNotifications 统一重写 */
+      },
+      () => saveState(current),
+    );
+  } catch (err) {
+    for (const { key, entry } of toPurge) {
+      current.agents[key] = entry;
+    }
+    if (previousPending) current.pendingReaderRevokes = previousPending;
+    else delete current.pendingReaderRevokes;
+    throw err;
+  }
+
+  for (const { key } of toPurge) {
+    recordAuditEvent({
+      event: 'identity.notify_route.delete',
+      outcome: 'ok',
+      address: key,
+      actor,
+    });
+  }
+  return true;
 }
 
 async function state(): Promise<NotifyState> {
@@ -793,12 +1205,18 @@ export async function reconcileNotificationDevices(skipDeviceId?: string): Promi
   if (!config.ntfy.enabled || !config.ntfy.adminPassword) return;
   // skip 路径只清其它 pending，不占用/替换 list 的 in-flight coalesce。
   if (skipDeviceId) {
-    return reconcilePendingRevokes(deleteNtfyUserResult, skipDeviceId);
+    await reconcilePendingRevokes(deleteNtfyUserResult, skipDeviceId);
+    await reconcilePendingReaderRevokes(deleteNtfyUserResult);
+    return;
   }
   // 并发入口共用一次 in-flight（同一 tick 的 list/revoke 不放大 ntfy）。
   // 不做跨请求 TTL：列表必须能收敛刚写入的 pending_revoke。
   if (reconcileInFlight) return reconcileInFlight;
-  const run = reconcilePendingRevokes(deleteNtfyUserResult).finally(() => {
+  const run = (async () => {
+    await reconcilePendingRevokes(deleteNtfyUserResult);
+    // agent reader 吊销与 phone 设备线共用同一对账挂点。
+    await reconcilePendingReaderRevokes(deleteNtfyUserResult);
+  })().finally(() => {
     if (reconcileInFlight === run) reconcileInFlight = null;
   });
   reconcileInFlight = run;
@@ -1144,6 +1562,13 @@ export function notificationService(): NtfyNotificationService {
  * is returned, so there is no window where a client receives an identity that
  * lacks the reader account promised by the notification model.
  */
+/** @internal 测试缝：createRuntimeReader 成功后、二次确认前注入（模拟同址删竞态）。 */
+let afterCreateRuntimeReaderForTests: (() => void) | null = null;
+
+export function setAfterCreateRuntimeReaderForTests(fn: (() => void) | null): void {
+  afterCreateRuntimeReaderForTests = fn;
+}
+
 export async function provisionIdentityNotifications(identity: Identity): Promise<void> {
   if (!config.ntfy.enabled) return;
   if (!config.ntfy.adminPassword) throw new NotifyError('notifications_unconfigured');
@@ -1162,6 +1587,16 @@ export async function provisionIdentityNotifications(identity: Identity): Promis
   try {
     await createRuntimeReader(entry);
     runtimeReaderCreated = true;
+    // 测试缝：模拟 createRuntimeReader 成功后、提交前身份被删。
+    afterCreateRuntimeReaderForTests?.();
+    // 二次确认：create/delete 同址竞态下身份可能已删——吊销刚建 reader，放弃提交。
+    if (!findIdentity(agent)) {
+      if (existing) current.agents[agent] = existing;
+      else delete current.agents[agent];
+      await deleteRuntimeReader(entry);
+      runtimeReaderCreated = false;
+      return;
+    }
     // Keep the declarative startup config in sync with the live reader. ntfy
     // will consume this same token on every later restart.
     await commitNotificationState(
@@ -1220,6 +1655,8 @@ export async function notifyTrustedAgentDelivery(address: string): Promise<void>
 export async function initializeNotifications(): Promise<void> {
   const current = await state();
   let changed = false;
+  // 先清完整地址幽灵键（身份已不存在）；裸 localpart 键一行不动。
+  if (purgeOrphanFullAddressAgentRoutes('boot_reconcile')) changed = true;
   // Provision a reader account for every identity that already exists before
   // ntfy boots. These private routes remain server-only; phone pairing grants
   // a separate account only to the two human topics.

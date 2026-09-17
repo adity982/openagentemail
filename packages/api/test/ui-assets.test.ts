@@ -268,9 +268,17 @@ describe('UI static asset contract', () => {
     expect(CONNECT_PAGE_JS).toContain(
       'if (!connectCredentialValue || !connectRevealed) return;',
     );
+    // R2：logout/离页代际作废，迟到响应不得复活明文
+    expect(CONNECT_PAGE_JS).toContain('var connectLoadGen = 0');
+    expect(CONNECT_PAGE_JS).toContain('connectLoadGen += 1');
+    expect(CONNECT_PAGE_JS).toContain(
+      "if (state.scope !== 'connect' || generation !== connectLoadGen) return;",
+    );
     expect(CONNECT_PAGE_JS).toContain("split(connectCredentialValue).join('<identity-token>')");
     expect(CONNECT_PAGE_JS).not.toMatch(/console\s*\./);
     expect(CONNECT_PAGE_JS).not.toMatch(/localStorage|sessionStorage|indexedDB/);
+    // R2 P1-1：appNav 点击链必须认 connect，否则 data-nav 真点击永不进页
+    expect(UI_JS).toContain("else if (key === 'connect') navigateTo('connect')");
   });
 
   test('shell deep-links register after api/oauth/frame and do not swallow them', async () => {

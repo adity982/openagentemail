@@ -568,14 +568,7 @@ export function isValidMessageUid(id: string): boolean {
   return Number.isSafeInteger(uid) && uid <= 4_294_967_295;
 }
 
-/** Connect 明文 token 下发审计节流窗口：按会话/IP 每分钟至多 1 条，防写放大。 */
-const CONNECT_REVEAL_AUDIT_THROTTLE_MS = 60 * 1000;
-const lastConnectRevealAuditAt = new Map<string, number>();
-
-/** 测试辅助：清空 Connect reveal 审计节流时钟。 */
-export function resetConnectRevealAuditThrottleForTests(): void {
-  lastConnectRevealAuditAt.clear();
-}
+/** Connect 明文 token 下发审计节流已迁入 UiSessionStore（cleanup + MAX_TRACKED_IPS）。 */
 
 /**
  * GET /ui/api/connect 防御深度：仅放行 Sec-Fetch-Site=same-origin|none。
@@ -621,14 +614,10 @@ export function createUiApiRoutes(
 
     const sid = c.get('uiSessionSid');
     const token = store.identityTokenForSession(sid, auth.address);
-    // P2-1：明文 token 非空返回才落 identity.token.reveal；按会话+IP 节流
+    // P2-1：明文 token 非空返回才落 identity.token.reveal；按会话+IP 节流（店内 cleanup 封顶）
     if (token) {
       const ip = clientIp(c);
-      const throttleKey = `${sid}:${ip}`;
-      const now = Date.now();
-      const lastAt = lastConnectRevealAuditAt.get(throttleKey) ?? 0;
-      if (now - lastAt >= CONNECT_REVEAL_AUDIT_THROTTLE_MS) {
-        lastConnectRevealAuditAt.set(throttleKey, now);
+      if (store.claimConnectRevealAudit(sid, ip)) {
         recordAuditEvent({
           event: 'identity.token.reveal',
           address: auth.address,

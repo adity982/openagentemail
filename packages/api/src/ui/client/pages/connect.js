@@ -1,6 +1,8 @@
 var connectCredentialValue = '';
 var connectEndpointValue = '';
 var connectRevealed = false;
+/** 代际：clear/logout 自增，迟到的 loadConnectPage 响应不得复活明文。 */
+var connectLoadGen = 0;
 
 function shellSingleQuote(value) {
   return "'" + String(value).replace(/'/g, "'\\''") + "'";
@@ -159,6 +161,8 @@ function renderConnectCards() {
 }
 
 function clearConnectSensitiveState() {
+  // 失效在途 loadConnectPage（含 logout / 离页 / 重进）
+  connectLoadGen += 1;
   connectCredentialValue = '';
   connectEndpointValue = '';
   connectRevealed = false;
@@ -174,10 +178,12 @@ function clearConnectSensitiveState() {
 
 async function loadConnectPage() {
   clearConnectSensitiveState();
+  var generation = connectLoadGen;
   connectState.textContent = 'Loading connection details…';
   try {
     var payload = await apiJson('/ui/api/connect');
-    if (state.scope !== 'connect') return;
+    // 双闸：仍在 connect scope，且代际未被 logout/离页作废
+    if (state.scope !== 'connect' || generation !== connectLoadGen) return;
     connectEndpointValue = payload.endpoint || '';
     connectEndpoint.textContent = connectEndpointValue;
     if (payload.unavailable === 'identity_session_required') {
@@ -201,6 +207,7 @@ async function loadConnectPage() {
       'Reveal the token to enable ready-to-copy setup for each agent.';
     renderConnectCards();
   } catch (error) {
+    if (generation !== connectLoadGen) return;
     if (error.message !== 'session_expired') {
       connectState.textContent =
         'Connection details could not be loaded. Try opening this page again.';

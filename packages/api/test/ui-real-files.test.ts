@@ -120,9 +120,9 @@ describe('UI real-file manifest (#520-A)', () => {
         .update(Buffer.from(s, 'utf8'))
         .digest('hex');
     // #134、#196/R3 与 #231 Connect 页面均为有意 UI 变更；更新前已确认差异有意。
-    // #231 续作：Copy token 纳入 reveal 门控后更新 UI_JS；CSS 针脚对齐合并 main 后实字节。
+    // #231 R2：appNav connect 分支 + connectLoadGen 代际守卫后更新 UI_JS 针脚。
     expect(sha256(UI_JS)).toBe(
-      'cf8c88eb75c76688d9521274d9a12fca1081789cb4568b4bc0665b9c17f70e8f',
+      'f9a84b7771ea151930bfce93ee8eac0d2fc2b99a99441ac13a107ab41d55ac22',
     );
     expect(sha256(UI_CSS)).toBe(
       'bccfd50b1660b04dde56701ad2c5d1aae7d0900de4990c0d75a03318f2d06043',

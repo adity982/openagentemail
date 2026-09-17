@@ -14,11 +14,12 @@ process.env.DATA_DIR = mkdtempSync(join(tmpdir(), 'oae-ui-connect-'));
 const { describe, expect, test, beforeEach } = await import('bun:test');
 const { createApp } = await import('../src/app.ts');
 const { Hono } = await import('hono');
-const { UiSessionStore, COOKIE_NAME } = await import('../src/lib/ui-session.ts');
 const {
-  createUiApiRoutes,
-  resetConnectRevealAuditThrottleForTests,
-} = await import('../src/routes/ui.ts');
+  UiSessionStore,
+  COOKIE_NAME,
+  CONNECT_REVEAL_AUDIT_THROTTLE_MS,
+} = await import('../src/lib/ui-session.ts');
+const { createUiApiRoutes } = await import('../src/routes/ui.ts');
 const { readAuditEvents, resetAuditForTests } = await import('../src/lib/audit.ts');
 
 function tokenHash(token: string): string {
@@ -66,7 +67,6 @@ async function login(
 
 beforeEach(() => {
   resetAuditForTests();
-  resetConnectRevealAuditThrottleForTests();
 });
 
 describe('Connect-agent dashboard API', () => {
@@ -228,5 +228,47 @@ describe('Connect-agent dashboard API', () => {
       unavailable: 'token_unavailable',
     });
     expect(readAuditEvents({ event: 'identity.token.reveal' })).toHaveLength(0);
+  });
+});
+
+describe('Connect reveal audit throttle map (R2, UiSessionStore cleanup)', () => {
+  test('expired connect-reveal throttle entries are pruned on cleanup', () => {
+    const store = new UiSessionStore({ resolveToken: resolver });
+    const t0 = 1_000_000;
+    store.seedConnectRevealAuditForTests('sid-a:10.0.0.1', t0);
+    store.seedConnectRevealAuditForTests('sid-b:10.0.0.2', t0);
+    expect(store.connectRevealAuditSizeForTests()).toBe(2);
+
+    // 窗口边界（==）不删；对齐 lastMintDeniedAuditAt 的 `>` 语义
+    store.cleanupThrottleMapsForTests(t0 + CONNECT_REVEAL_AUDIT_THROTTLE_MS);
+    expect(store.connectRevealAuditSizeForTests()).toBe(2);
+
+    store.cleanupThrottleMapsForTests(t0 + CONNECT_REVEAL_AUDIT_THROTTLE_MS + 1);
+    expect(store.connectRevealAuditSizeForTests()).toBe(0);
+  });
+
+  test('connect-reveal throttle map is capped at MAX_TRACKED_IPS=1000', () => {
+    const store = new UiSessionStore({ resolveToken: resolver });
+    const now = Date.now();
+    for (let i = 0; i < 1005; i += 1) {
+      store.seedConnectRevealAuditForTests(`sid-${i}:127.0.0.1`, now);
+    }
+    expect(store.connectRevealAuditSizeForTests()).toBe(1005);
+    store.cleanupThrottleMapsForTests(now);
+    expect(store.connectRevealAuditSizeForTests()).toBe(1000);
+  });
+
+  test('claimConnectRevealAudit returns false inside the one-minute window', () => {
+    const store = new UiSessionStore({ resolveToken: resolver });
+    const t0 = 5_000_000;
+    expect(store.claimConnectRevealAudit('sid-1', '203.0.113.9', t0)).toBe(true);
+    expect(store.claimConnectRevealAudit('sid-1', '203.0.113.9', t0 + 1)).toBe(false);
+    expect(
+      store.claimConnectRevealAudit(
+        'sid-1',
+        '203.0.113.9',
+        t0 + CONNECT_REVEAL_AUDIT_THROTTLE_MS,
+      ),
+    ).toBe(true);
   });
 });

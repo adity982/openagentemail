@@ -254,3 +254,15 @@ connectTokenCopy.addEventListener('click', function () {
   if (!connectCredentialValue || !connectRevealed) return;
   copyValue(connectCredentialValue, connectToken, connectTokenCopy);
 });
+
+// R4 a案：bfcache 会冻住 JS 堆+DOM；SPA 离页清态走不到整页离开。
+// pagehide 清敏感态（含代际自增）；pageshow persisted 强制回遮蔽，须重新 Reveal。
+window.addEventListener('pagehide', function () {
+  clearConnectSensitiveState();
+});
+
+window.addEventListener('pageshow', function (event) {
+  if (!event.persisted) return;
+  // 从 bfcache 复活：再清一次敏感态并钉死遮蔽 UI（token 须重新加载后 Reveal）
+  clearConnectSensitiveState();
+});

@@ -20,9 +20,9 @@ function connectAgentDefinitions(endpoint, token) {
       name: 'Kimi Code',
       location: '~/.kimi-code/mcp.json',
       config: jsonConfig(jsonServer),
-      // i案：instruction 不含 config/token；指引先 Copy setup 落盘，再令 agent 读本地配置自验
+      // R5：掐读回——写入后重启/重连即生效；勿读回含 token 文件、勿打印
       prompt:
-        'I already saved openagent-email into ~/.kimi-code/mcp.json with Copy setup. Do not ask me to paste a token. Read that local file, keep the bearer private (never print or commit it), start a new Kimi Code session, and verify the server with /mcp.',
+        'I already saved openagent-email into ~/.kimi-code/mcp.json with Copy setup. Do not ask me to paste a token. Do not read that file back or print the bearer. Restart or reconnect the agent so the new MCP entry takes effect.',
     },
     {
       name: 'Codex',
@@ -34,7 +34,7 @@ function connectAgentDefinitions(endpoint, token) {
         JSON.stringify(authorization) +
         ' }',
       prompt:
-        'I already added openagent_email to ~/.codex/config.toml with Copy setup. Do not ask me to paste a token. Read that local config, preserve my other settings, never print or commit the bearer, and verify with codex mcp get openagent_email.',
+        'I already added openagent_email to ~/.codex/config.toml with Copy setup. Do not ask me to paste a token. Do not read that config back or print the bearer. Restart or reconnect so the MCP server takes effect.',
     },
     {
       name: 'Claude Code',
@@ -45,14 +45,14 @@ function connectAgentDefinitions(endpoint, token) {
         ' openagent-email ' +
         shellSingleQuote(endpoint),
       prompt:
-        'I already ran the Copy setup command to register openagent-email in Claude Code at user scope. Do not ask me to paste a token. Confirm the local MCP entry, never echo or commit the bearer, then run claude mcp get openagent-email to verify it.',
+        'I already ran the Copy setup command to register openagent-email in Claude Code at user scope. Do not ask me to paste a token. Do not read the local MCP entry back or echo the bearer. Restart or reconnect so it takes effect.',
     },
     {
       name: 'Cursor',
       location: '~/.cursor/mcp.json',
       config: jsonConfig(jsonServer),
       prompt:
-        'I already merged openagent-email into ~/.cursor/mcp.json with Copy setup. Do not ask me to paste a token. Read that local file without removing other servers, keep the bearer private, then open Cursor MCP settings and confirm openagent-email connects.',
+        'I already merged openagent-email into ~/.cursor/mcp.json with Copy setup. Do not ask me to paste a token. Do not read that file back or print the bearer. Restart or reconnect Cursor MCP so openagent-email takes effect.',
     },
     {
       name: 'ZCode',
@@ -73,7 +73,7 @@ function connectAgentDefinitions(endpoint, token) {
         2,
       ),
       prompt:
-        'I already merged openagent-email into mcp.servers in ~/.zcode/cli/config.json with Copy setup. Do not ask me to paste a token. Read that local config without changing my other settings, keep the bearer private, restart the agent session, and verify openagent-email in Settings > MCP Servers.',
+        'I already merged openagent-email into mcp.servers in ~/.zcode/cli/config.json with Copy setup. Do not ask me to paste a token. Do not read that config back or print the bearer. Restart or reconnect the agent session so it takes effect.',
     },
     {
       name: 'ChatGPT',
@@ -255,14 +255,17 @@ connectTokenCopy.addEventListener('click', function () {
   copyValue(connectCredentialValue, connectToken, connectTokenCopy);
 });
 
-// R4 a案：bfcache 会冻住 JS 堆+DOM；SPA 离页清态走不到整页离开。
-// pagehide 清敏感态（含代际自增）；pageshow persisted 强制回遮蔽，须重新 Reveal。
+// R4/R5：bfcache 会冻住 JS 堆+DOM；SPA 离页清态走不到整页离开。
+// pagehide 清敏感态；pageshow persisted 且仍在 connect 时重拉面板（仍遮蔽，须 Reveal）。
 window.addEventListener('pagehide', function () {
   clearConnectSensitiveState();
 });
 
 window.addEventListener('pageshow', function (event) {
   if (!event.persisted) return;
-  // 从 bfcache 复活：再清一次敏感态并钉死遮蔽 UI（token 须重新加载后 Reveal）
+  if (state.scope === 'connect') {
+    // R5：数据重来、token 仍需 reveal；安全姿态不变（返回 Promise 便于测）
+    return loadConnectPage();
+  }
   clearConnectSensitiveState();
 });

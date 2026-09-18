@@ -276,6 +276,14 @@ describe('UI static asset contract', () => {
     expect(CONNECT_PAGE_JS).toContain('definition.prompt,');
     expect(CONNECT_PAGE_JS).toContain('with Copy setup');
     expect(CONNECT_PAGE_JS).toContain('Do not ask me to paste a token');
+    // R5：掐读回——写入后重启/重连；禁止读回含 token 文件
+    expect(CONNECT_PAGE_JS).toContain('Do not read that file back or print the bearer');
+    expect(CONNECT_PAGE_JS).toContain('Do not read that config back or print the bearer');
+    expect(CONNECT_PAGE_JS).toContain('Restart or reconnect');
+    expect(CONNECT_PAGE_JS).not.toContain('Read that local file');
+    expect(CONNECT_PAGE_JS).not.toContain('Read that local config');
+    expect(CONNECT_PAGE_JS).not.toContain('codex mcp get openagent_email');
+    expect(CONNECT_PAGE_JS).not.toContain('claude mcp get openagent-email');
     // R2：logout/离页代际作废，迟到响应不得复活明文
     expect(CONNECT_PAGE_JS).toContain('var connectLoadGen = 0');
     expect(CONNECT_PAGE_JS).toContain('connectLoadGen += 1');
@@ -283,10 +291,12 @@ describe('UI static asset contract', () => {
       "if (state.scope !== 'connect' || generation !== connectLoadGen) return;",
     );
     expect(CONNECT_PAGE_JS).toContain("split(connectCredentialValue).join('<identity-token>')");
-    // R4 a案：bfcache pagehide 清态 + pageshow persisted 强制回遮蔽
+    // R4/R5：bfcache pagehide 清态；persisted+connect 重跑 loadConnectPage
     expect(CONNECT_PAGE_JS).toContain("window.addEventListener('pagehide'");
     expect(CONNECT_PAGE_JS).toContain("window.addEventListener('pageshow'");
     expect(CONNECT_PAGE_JS).toContain('if (!event.persisted) return;');
+    expect(CONNECT_PAGE_JS).toContain("if (state.scope === 'connect')");
+    expect(CONNECT_PAGE_JS).toContain('loadConnectPage()');
     expect(CONNECT_PAGE_JS).toContain('clearConnectSensitiveState()');
     expect(CONNECT_PAGE_JS).not.toMatch(/console\s*\./);
     expect(CONNECT_PAGE_JS).not.toMatch(/localStorage|sessionStorage|indexedDB/);

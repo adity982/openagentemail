@@ -1,7 +1,7 @@
 /**
- * R4 a案：bfcache 复活不得带回 Connect reveal 明文。
- * 仓库无 jsdom；抽出 clearConnectSensitiveState + pagehide/pageshow 监听体，
- * 用可控 window/DOM 模拟 persisted 往返并断言明文不复活。
+ * R4/R5：bfcache 复活不得带回 Connect reveal 明文；
+ * R5：persisted + connect scope 须重跑 loadConnectPage（面板重载、仍遮蔽）。
+ * 仓库无 jsdom；抽出真实 clear / load / 监听体，用可控 Promise 模拟。
  */
 import { describe, expect, test } from 'bun:test';
 
@@ -14,7 +14,14 @@ function extractClearConnectSensitiveState(): string {
   return CONNECT_PAGE_JS.slice(start, end);
 }
 
-/** 抽出 pagehide / pageshow 注册块（含 R4 a案监听）。 */
+function extractLoadConnectPage(): string {
+  const start = CONNECT_PAGE_JS.indexOf('async function loadConnectPage(');
+  const end = CONNECT_PAGE_JS.indexOf('function enterConnect(');
+  if (start < 0 || end <= start) throw new Error('loadConnectPage slice missing');
+  return CONNECT_PAGE_JS.slice(start, end);
+}
+
+/** 抽出 pagehide / pageshow 注册块。 */
 function extractBfcacheListeners(): string {
   const marker = "window.addEventListener('pagehide'";
   const start = CONNECT_PAGE_JS.indexOf(marker);
@@ -22,32 +29,58 @@ function extractBfcacheListeners(): string {
   return CONNECT_PAGE_JS.slice(start);
 }
 
+type ConnectPayload = {
+  endpoint: string;
+  identity: string | null;
+  token: string | null;
+  unavailable: string | null;
+};
+
+type Deferred<T> = {
+  promise: Promise<T>;
+  resolve: (value: T) => void;
+  reject: (reason?: unknown) => void;
+};
+
 type Harness = {
+  state: { scope: string };
   connectLoadGen: { value: number };
   connectCredentialValue: { value: string };
   connectRevealed: { value: boolean };
   connectTokenText: { value: string };
   connectTokenRevealText: { value: string };
   connectTokenCopyDisabled: { value: boolean };
+  connectCredentialHidden: { value: boolean };
+  connectEndpointText: { value: string };
+  connectStateText: { value: string };
+  loadCalls: { value: number };
+  pulls: Array<Deferred<ConnectPayload>>;
   dispatchPagehide: () => void;
-  dispatchPageshow: (persisted: boolean) => void;
+  dispatchPageshow: (persisted: boolean) => void | Promise<void>;
 };
 
-function makeHarness(): Harness {
+function makeHarness(initialScope = 'connect'): Harness {
   const box: {
+    state?: { scope: string };
     connectLoadGen?: { value: number };
     connectCredentialValue?: { value: string };
     connectRevealed?: { value: boolean };
     connectTokenText?: { value: string };
     connectTokenRevealText?: { value: string };
     connectTokenCopyDisabled?: { value: boolean };
+    connectCredentialHidden?: { value: boolean };
+    connectEndpointText?: { value: string };
+    connectStateText?: { value: string };
+    loadCalls?: { value: number };
+    pulls: Array<Deferred<ConnectPayload>>;
     dispatchPagehide?: () => void;
-    dispatchPageshow?: (persisted: boolean) => void;
-  } = {};
+    dispatchPageshow?: (persisted: boolean) => void | Promise<void>;
+  } = { pulls: [] };
 
   new Function(
     'box',
     `
+      var state = { scope: ${JSON.stringify(initialScope)} };
       var connectLoadGen = 0;
       var connectCredentialValue = 'oa_bfcache-secret';
       var connectEndpointValue = 'https://mail.example/mcp';
@@ -66,14 +99,37 @@ function makeHarness(): Harness {
       var connectIdentity = { textContent: 'fox@test.example' };
       var connectCredential = { hidden: false };
       var connectCards = { replaceChildren: function () {} };
+      var connectState = {
+        get textContent() { return box.connectStateText.value; },
+        set textContent(v) { box.connectStateText.value = v; },
+      };
+      box.connectStateText = { value: '' };
+      box.loadCalls = { value: 0 };
+      function renderConnectCards() {}
+      async function apiJson() {
+        var pending = { promise: null, resolve: null, reject: null };
+        pending.promise = new Promise(function (resolve, reject) {
+          pending.resolve = resolve;
+          pending.reject = reject;
+        });
+        box.pulls.push(pending);
+        return pending.promise;
+      }
+      ${extractClearConnectSensitiveState()}
+      ${extractLoadConnectPage()}
+      var _loadConnectPage = loadConnectPage;
+      loadConnectPage = async function () {
+        box.loadCalls.value += 1;
+        return _loadConnectPage();
+      };
       var listeners = { pagehide: null, pageshow: null };
       var window = {
         addEventListener: function (type, fn) {
           listeners[type] = fn;
         },
       };
-      ${extractClearConnectSensitiveState()}
       ${extractBfcacheListeners()}
+      box.state = state;
       box.connectLoadGen = {
         get value() { return connectLoadGen; },
       };
@@ -95,11 +151,17 @@ function makeHarness(): Harness {
       box.connectTokenCopyDisabled = {
         get value() { return connectTokenCopy.disabled; },
       };
+      box.connectCredentialHidden = {
+        get value() { return connectCredential.hidden; },
+      };
+      box.connectEndpointText = {
+        get value() { return connectEndpoint.textContent; },
+      };
       box.dispatchPagehide = function () {
         listeners.pagehide({ persisted: true });
       };
       box.dispatchPageshow = function (persisted) {
-        listeners.pageshow({ persisted: persisted });
+        return listeners.pageshow({ persisted: persisted });
       };
     `,
   )(box);
@@ -107,7 +169,7 @@ function makeHarness(): Harness {
   return box as Harness;
 }
 
-describe('Connect page bfcache reveal guard (R4)', () => {
+describe('Connect page bfcache reveal guard (R4/R5)', () => {
   test('pagehide clears plaintext via clearConnectSensitiveState', () => {
     const box = makeHarness();
     expect(box.connectCredentialValue.value).toBe('oa_bfcache-secret');
@@ -124,31 +186,61 @@ describe('Connect page bfcache reveal guard (R4)', () => {
     expect(box.connectTokenCopyDisabled.value).toBe(true);
   });
 
-  test('pageshow persisted resets reveal; plaintext must not resurrect', () => {
-    const box = makeHarness();
+  test('pageshow persisted on connect reloads panel without plaintext', async () => {
+    const box = makeHarness('connect');
     box.dispatchPagehide();
+    expect(box.connectCredentialValue.value).toBe('');
 
-    // 负控/敌对：模拟异常恢复路径试图把明文写回堆与 DOM
+    // 负控：敌对回填明文后再 persisted 复活
     box.connectCredentialValue.value = 'oa_bfcache-secret';
     box.connectRevealed.value = true;
     box.connectTokenText.value = 'oa_bfcache-secret';
 
-    box.dispatchPageshow(true);
+    const pageshowDone = Promise.resolve(box.dispatchPageshow(true));
+    expect(box.loadCalls.value).toBe(1);
+    expect(box.pulls.length).toBe(1);
 
-    // persisted 复活必须清敏感态并强制回遮蔽；明文不得留在堆或 DOM
+    // 加载途中：clear 已执行，DOM 无明文、reveal 关
     expect(box.connectCredentialValue.value).toBe('');
+    expect(box.connectRevealed.value).toBe(false);
+    expect(box.connectTokenText.value).toBe('••••••••••••');
+    expect(box.connectTokenCopyDisabled.value).toBe(true);
+
+    box.pulls[0]!.resolve({
+      endpoint: 'https://mail.example/mcp',
+      identity: 'fox@test.example',
+      token: 'oa_fresh-after-bfcache',
+      unavailable: null,
+    });
+    await pageshowDone;
+
+    // 面板重载完成：有 endpoint、凭证区可见，但仍遮蔽（须再 Reveal）
+    expect(box.connectEndpointText.value).toBe('https://mail.example/mcp');
+    expect(box.connectCredentialHidden.value).toBe(false);
+    expect(box.connectCredentialValue.value).toBe('oa_fresh-after-bfcache');
     expect(box.connectRevealed.value).toBe(false);
     expect(box.connectTokenText.value).toBe('••••••••••••');
     expect(box.connectTokenRevealText.value).toBe('Reveal');
     expect(box.connectTokenCopyDisabled.value).toBe(true);
+    expect(box.connectTokenText.value).not.toBe('oa_fresh-after-bfcache');
     expect(box.connectTokenText.value).not.toBe('oa_bfcache-secret');
-    expect(box.connectLoadGen.value).toBe(2); // pagehide + pageshow 各自增一次
+  });
+
+  test('pageshow persisted off connect only clears, does not reload', () => {
+    const box = makeHarness('overview');
+    box.dispatchPagehide();
+    box.dispatchPageshow(true);
+    expect(box.loadCalls.value).toBe(0);
+    expect(box.connectCredentialValue.value).toBe('');
+    expect(box.connectRevealed.value).toBe(false);
+    expect(box.connectTokenText.value).toBe('••••••••••••');
   });
 
   test('pageshow without persisted leaves reveal state alone', () => {
     const box = makeHarness();
     // 首次 pageshow persisted=false 不得误清（正常导航进入）
     box.dispatchPageshow(false);
+    expect(box.loadCalls.value).toBe(0);
     expect(box.connectCredentialValue.value).toBe('oa_bfcache-secret');
     expect(box.connectRevealed.value).toBe(true);
     expect(box.connectTokenText.value).toBe('oa_bfcache-secret');

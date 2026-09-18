@@ -284,6 +284,13 @@ describe('UI static asset contract', () => {
     expect(CONNECT_PAGE_JS).not.toContain('Read that local config');
     expect(CONNECT_PAGE_JS).not.toContain('codex mcp get openagent_email');
     expect(CONNECT_PAGE_JS).not.toContain('claude mcp get openagent-email');
+    // R6：Claude 卡命令本体零凭证——$OAE_TOKEN 变量引用 + read -s 指引
+    expect(CONNECT_PAGE_JS).toContain('$OAE_TOKEN');
+    expect(CONNECT_PAGE_JS).toContain("read -s OAE_TOKEN");
+    expect(CONNECT_PAGE_JS).toContain("'Authorization: Bearer '");
+    expect(CONNECT_PAGE_JS).not.toContain(
+      "shellSingleQuote('Authorization: ' + authorization)",
+    );
     // R2：logout/离页代际作废，迟到响应不得复活明文
     expect(CONNECT_PAGE_JS).toContain('var connectLoadGen = 0');
     expect(CONNECT_PAGE_JS).toContain('connectLoadGen += 1');

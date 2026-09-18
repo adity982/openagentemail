@@ -39,13 +39,15 @@ function connectAgentDefinitions(endpoint, token) {
     {
       name: 'Claude Code',
       location: 'Terminal command',
+      // R6：命令本体零凭证——header 用 $OAE_TOKEN 变量引用（单引号外展开）
       config:
         'claude mcp add --transport http --scope user --header ' +
-        shellSingleQuote('Authorization: ' + authorization) +
+        "'Authorization: Bearer '" +
+        '$OAE_TOKEN' +
         ' openagent-email ' +
         shellSingleQuote(endpoint),
       prompt:
-        'I already ran the Copy setup command to register openagent-email in Claude Code at user scope. Do not ask me to paste a token. Do not read the local MCP entry back or echo the bearer. Restart or reconnect so it takes effect.',
+        'In your shell, run read -s OAE_TOKEN and paste the identity token (silent input, not saved to history), then press Enter. Next run the Copy setup command; it references $OAE_TOKEN and never embeds the bearer. Do not echo or print OAE_TOKEN. Restart or reconnect so Claude Code picks up the MCP entry.',
     },
     {
       name: 'Cursor',

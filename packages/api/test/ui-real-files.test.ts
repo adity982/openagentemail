@@ -120,9 +120,9 @@ describe('UI real-file manifest (#520-A)', () => {
         .update(Buffer.from(s, 'utf8'))
         .digest('hex');
     // #134、#196/R3 与 #231 Connect 页面均为有意 UI 变更；更新前已确认差异有意。
-    // #231 R5：掐读回 prompt + bfcache persisted 重载后更新 UI_JS 针脚。
+    // #231 R6：Claude 卡 $OAE_TOKEN 零凭证命令后更新 UI_JS 针脚。
     expect(sha256(UI_JS)).toBe(
-      '3b34aa5ad5a91e6603708ec020a346c610814d23c80eae567cfe5155ce72610d',
+      'a9fae6babe450c4d8d5b7f714a2edf3ead4d04be2fb7013ea2c571cc978463c5',
     );
     expect(sha256(UI_CSS)).toBe(
       'bccfd50b1660b04dde56701ad2c5d1aae7d0900de4990c0d75a03318f2d06043',
